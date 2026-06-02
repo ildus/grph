@@ -225,7 +225,7 @@ impl McpSession {
             return tool_call_result(
                 id,
                 tools::mcp_error(format!(
-                    "Tool {tool_name} is disabled via GRPH_MCP_TOOLS/CODEGRAPH_MCP_TOOLS"
+                    "Tool {tool_name} is disabled via GRPH_MCP_TOOLS"
                 )),
             );
         }

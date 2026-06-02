@@ -502,9 +502,7 @@ fn optional_bool(args: &Map<String, Value>, key: &str) -> std::result::Result<()
 }
 
 pub fn is_tool_allowed(tool_name: &str) -> bool {
-    let allowlist = std::env::var("GRPH_MCP_TOOLS")
-        .ok()
-        .or_else(|| std::env::var("CODEGRAPH_MCP_TOOLS").ok());
+    let allowlist = std::env::var("GRPH_MCP_TOOLS").ok();
     let Some(raw) = allowlist else {
         return true;
     };
@@ -521,9 +519,6 @@ pub fn is_tool_allowed(tool_name: &str) -> bool {
 }
 
 pub fn normalize_tool_name(name: &str) -> String {
-    let short = name
-        .strip_prefix("grph_")
-        .or_else(|| name.strip_prefix("codegraph_"))
-        .unwrap_or(name);
+    let short = name.strip_prefix("grph_").unwrap_or(name);
     format!("grph_{}", short)
 }

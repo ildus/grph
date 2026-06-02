@@ -145,55 +145,21 @@ fn mcp_tool_allowlist_filters_and_enforces_execution() {
 }
 
 #[test]
-fn mcp_tool_allowlist_accepts_codegraph_names_and_empty_means_full_surface() {
+fn mcp_tool_allowlist_empty_means_full_surface() {
     let _env = env_lock();
-    let dir = temp_project("allowlist-codegraph");
+    let dir = temp_project("allowlist-empty");
     let mut grph = Grph::init(&dir).unwrap();
     grph.index(|_| {}).unwrap();
 
-    std::env::set_var("CODEGRAPH_MCP_TOOLS", " codegraph_trace , search ");
-    let tools = grph_mcp::transport::handle_message(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
-        &dir,
-    );
-    assert!(tools.contains("grph_search"), "{tools}");
-    assert!(tools.contains("grph_trace"), "{tools}");
-    assert!(!tools.contains("grph_context"), "{tools}");
-
-    std::env::remove_var("CODEGRAPH_MCP_TOOLS");
     std::env::set_var("GRPH_MCP_TOOLS", "   ");
     let full = grph_mcp::transport::handle_message(
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
         &dir,
     );
     std::env::remove_var("GRPH_MCP_TOOLS");
     assert!(full.contains("grph_context"), "{full}");
     assert!(full.contains("grph_explore"), "{full}");
     assert!(full.contains("grph_trace"), "{full}");
-
-    fs::remove_dir_all(dir).ok();
-}
-
-#[test]
-fn mcp_tool_allowlist_rejects_disabled_codegraph_env_tool_on_execute() {
-    let _env = env_lock();
-    let dir = temp_project("allowlist-codegraph-exec");
-    let mut grph = Grph::init(&dir).unwrap();
-    grph.index(|_| {}).unwrap();
-
-    std::env::set_var("CODEGRAPH_MCP_TOOLS", "trace");
-    let blocked = grph_mcp::transport::handle_message(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codegraph_explore","arguments":{"query":"x"}}}"#,
-        &dir,
-    );
-    let allowed = grph_mcp::transport::handle_message(
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codegraph_trace","arguments":{"from":"a","to":"b"}}}"#,
-        &dir,
-    );
-    std::env::remove_var("CODEGRAPH_MCP_TOOLS");
-
-    assert!(blocked.contains("disabled via GRPH_MCP_TOOLS"), "{blocked}");
-    assert!(!allowed.contains("disabled via"), "{allowed}");
 
     fs::remove_dir_all(dir).ok();
 }
@@ -451,27 +417,21 @@ fn mcp_actionable_error_without_project_or_roots() {
 }
 
 #[test]
-fn mcp_accepts_codegraph_tool_aliases_and_validates_tool_arguments() {
+fn mcp_validates_tool_arguments() {
     let _env = env_lock();
-    let dir = temp_project("aliases-validation");
+    let dir = temp_project("argument-validation");
     fs::write(dir.join("main.py"), "def alpha():\n    return 1\n").unwrap();
     let mut grph = Grph::init(&dir).unwrap();
     grph.index(|_| {}).unwrap();
 
-    let alias_search = grph_mcp::transport::handle_message(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codegraph_search","arguments":{"query":"alpha"}}}"#,
-        &dir,
-    );
-    assert!(alias_search.contains("alpha"), "{alias_search}");
-
     let bad_query = grph_mcp::transport::handle_message(
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"grph_search","arguments":{"query":123}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grph_search","arguments":{"query":123}}}"#,
         &dir,
     );
     assert!(bad_query.contains("must be a string"), "{bad_query}");
 
     let bad_project_path = grph_mcp::transport::handle_message(
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"grph_search","arguments":{"query":"alpha","projectPath":123}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"grph_search","arguments":{"query":"alpha","projectPath":123}}}"#,
         &dir,
     );
     assert!(

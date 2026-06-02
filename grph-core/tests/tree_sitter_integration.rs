@@ -322,7 +322,7 @@ std::string App::run() { return greet("world"); }
 }
 
 #[test]
-fn extracts_c_multiple_includes_and_typedefs_from_codegraph_cases() {
+fn extracts_c_multiple_includes_and_typedefs() {
     let source = r#"
 #include <stdio.h>
 #include <nlohmann/json.hpp>
@@ -339,9 +339,8 @@ void greet(const char* name) { hello(name); }
     assert!(imports.contains(&"nlohmann/json.hpp".to_string()));
     assert!(imports.contains(&"config.h".to_string()));
 
-    // Ported from codegraph C/C++ import and typedef coverage: anonymous
-    // typedef struct/enum should be named after the typedef declarator rather
-    // than after the first field/enumerator inside the body.
+    // Anonymous typedef struct/enum should be named after the typedef declarator
+    // rather than after the first field/enumerator inside the body.
     assert!(node_names(&result, NodeKind::Struct).contains(&"Widget".to_string()));
     assert!(node_names(&result, NodeKind::Enum).contains(&"Color".to_string()));
     assert!(has_call(&result, "hello"));
@@ -385,7 +384,7 @@ II_EXTERN void exported(void);
 }
 
 #[test]
-fn extracts_cpp_inheritance_and_override_edges_from_codegraph_case() {
+fn extracts_cpp_inheritance_and_override_edges() {
     let source = r#"
 #include <iostream>
 class Iterator {
@@ -432,7 +431,7 @@ class DBIter : public Iterator {
 }
 
 #[test]
-fn extracts_rust_trait_relationships_from_codegraph_cases() {
+fn extracts_rust_trait_relationships() {
     let source = r#"
 pub struct MyCache {}
 
@@ -483,7 +482,7 @@ impl MyCache {
 }
 
 #[test]
-fn extracts_rust_import_roots_from_codegraph_cases() {
+fn extracts_rust_import_roots() {
     let cases = [
         ("use std::io;", "std"),
         ("use std::{ffi::OsStr, io, path::Path};", "std"),
@@ -509,7 +508,7 @@ fn extracts_rust_import_roots_from_codegraph_cases() {
 }
 
 #[test]
-fn extracts_go_imports_from_codegraph_cases() {
+fn extracts_go_imports() {
     let source = r#"
 package main
 
@@ -557,7 +556,7 @@ import _ "github.com/go-sql-driver/mysql"
 }
 
 #[test]
-fn extracts_js_ts_arrow_and_function_expression_exports_from_codegraph_cases() {
+fn extracts_js_ts_arrow_and_function_expression_exports() {
     let ts_source = r#"
 export const useAuth = (): AuthContextValue => {
   return useContext(AuthContext);
@@ -608,7 +607,7 @@ export const fetchData = async () => {
 }
 
 #[test]
-fn extracts_rust_attributes_and_macro_calls_from_codegraph_followups() {
+fn extracts_rust_attributes_and_macro_calls() {
     let source = r#"
 #[derive(Debug, Clone)]
 pub struct User {
@@ -647,7 +646,7 @@ fn smoke_test() {
 }
 
 #[test]
-fn extracts_ts_type_aliases_and_exported_constants_from_codegraph_cases() {
+fn extracts_ts_type_aliases_and_exported_constants() {
     let source = r#"
 export type UnitSystem = 'metric' | 'imperial';
 export type DateFormat = 'ISO' | 'US' | 'EU';
@@ -693,7 +692,7 @@ const internalConfig = { debug: true };
 }
 
 #[test]
-fn extracts_typescript_extends_and_implements_from_codegraph_case() {
+fn extracts_typescript_extends_and_implements() {
     let source = r#"
 class BaseController {}
 interface Serializable {}
@@ -721,7 +720,7 @@ class ChildController extends BaseController implements Serializable, JsonSerial
 }
 
 #[test]
-fn extracts_go_interfaces_from_codegraph_cases() {
+fn extracts_go_interfaces() {
     let source = r#"
 package main
 
@@ -773,7 +772,7 @@ type Config struct {
 }
 
 #[test]
-fn extracts_ts_decorators_from_codegraph_cases() {
+fn extracts_ts_decorators() {
     let source = r#"
 function A(cls: any) { return cls; }
 function B(cls: any) { return cls; }
@@ -850,7 +849,7 @@ class Svc {
 }
 
 #[test]
-fn extracts_go_constants_and_methods_from_codegraph_cases() {
+fn extracts_go_constants_and_methods() {
     let source = r#"
 package main
 
@@ -905,7 +904,7 @@ func (s Server) String() string {
 }
 
 #[test]
-fn extracts_ts_zod_and_xstate_exports_from_codegraph_cases() {
+fn extracts_ts_zod_and_xstate_exports() {
     let source = r#"
 export const userSchema = z.object({
   id: z.string(),

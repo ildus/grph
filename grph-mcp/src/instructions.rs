@@ -2,7 +2,7 @@
 pub const SERVER_INSTRUCTIONS: &str = r#"Grph is a semantic code intelligence tool. Use it to understand and query codebases.
 
 ## Answering Directly
-Use 2-3 codegraph calls maximum. Don't delegate to grep/read for code questions.
+Use 2-3 grph calls maximum. Don't delegate to grep/read for code questions.
 
 ## Tool Selection
 - **grph_search**: Quick symbol search by name

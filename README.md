@@ -1,10 +1,8 @@
 # grph
 
-> **Self-contained code intelligence CLI + MCP and LSP servers — a single binary
+Self-contained code intelligence CLI + MCP and LSP servers — a single binary
 for semantic search, call graph traversal, and AI agent context across
 Rust, Python, JavaScript/TypeScript, Go, C/C++, Shell, and embedded SQL/C.**
-
-Built in Rust with tree-sitter, rusqlite, and serde. No Node, no npm, no bundled runtime. Drop it on any machine, point your MCP client or editor at it, and get instant code graph superpowers.
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80+-orange.svg)](https://www.rust-lang.org)
@@ -187,8 +185,6 @@ Tool arguments use snake_case for grph-specific options, such as `max_nodes` and
 | `GRPH_MCP_TOOLS` | (all) | Comma-separated allowlist of MCP tools |
 | `GRPH_MCP_FRAME_BYTES` | `1048576` | Max `Content-Length` frame size in bytes |
 | `GRPH_MCP_MAX_MESSAGE_BYTES` | `1048576` | Max newline-delimited JSON message size in bytes |
-
-`CODEGRAPH_MCP_TOOLS` is also accepted as a compatibility alias for existing client configs.
 
 ## LSP Server
 
