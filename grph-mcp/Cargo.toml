@@ -1,0 +1,11 @@
+[package]
+name = "grph-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+grph-core = { path = "../grph-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "io-util", "macros"] }
+tracing = "0.1"

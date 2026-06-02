@@ -1,0 +1,3 @@
+[workspace]
+members = ["grph-core", "grph-mcp", "grph-lsp", "grph-cli"]
+resolver = "2"
