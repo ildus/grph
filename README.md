@@ -1,10 +1,10 @@
 # grph
 
-> **Self-contained code intelligence CLI + MCP server — a single binary
+> **Self-contained code intelligence CLI + MCP and LSP servers — a single binary
 for semantic search, call graph traversal, and AI agent context across
 Rust, Python, JavaScript/TypeScript, Go, C/C++, Shell, and embedded SQL/C.**
 
-Built in Rust with tree-sitter, rusqlite, and serde. No Node, no npm, no bundled runtime. Drop it on any machine, point your MCP client at it, and get instant code graph superpowers.
+Built in Rust with tree-sitter, rusqlite, and serde. No Node, no npm, no bundled runtime. Drop it on any machine, point your MCP client or editor at it, and get instant code graph superpowers.
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80+-orange.svg)](https://www.rust-lang.org)
@@ -18,7 +18,8 @@ Built in Rust with tree-sitter, rusqlite, and serde. No Node, no npm, no bundled
 - **Incremental sync** — `sync` detects changed files and replaces only stale graph fragments
 - **Call graph traversal** — `callers`, `callees`, and bounded BFS `trace` between symbols
 - **AI context builder** — Extracts keyword-matched source slices for agent task descriptions
-- **MCP server** — JSON-RPC over stdio, 10 tools, compatible with Claude Desktop, opencode, Goose, and other MCP clients
+- **MCP server** — JSON-RPC over stdio, 11 tools, compatible with Claude Desktop, opencode, Goose, and other MCP clients
+- **LSP server** — JSON-RPC over stdio for editor features backed by the same `.grph/grph.db` index
 - **Single binary** — ~12–14 MB, zero runtime dependencies
 - **`.gitignore`-aware** — Uses the `ignore` crate; skips `node_modules/`, `target/`, etc.
 
@@ -76,6 +77,9 @@ grph context "fix the authentication bug in login handler"
 
 # Start the MCP server from the current project
 grph serve --mcp
+
+# Start the LSP server from the current project
+grph serve --lsp
 ```
 
 ## CLI Commands
@@ -97,6 +101,7 @@ grph serve --mcp
 | `grph impact <symbol> [--depth <n>] [--json]` | Impact radius analysis |
 | `grph ctags [--output <path>]` | Generate Universal Ctags-compatible `tags` file |
 | `grph serve --mcp [--path <path>]` | Start MCP JSON-RPC server over stdio |
+| `grph serve --lsp [--path <path>]` | Start LSP JSON-RPC server over stdio |
 | `grph uninit [--force] [path]` | Remove `.grph` from a project |
 
 ## Ctags Generation
@@ -147,29 +152,63 @@ Configure your MCP client (e.g., Claude Desktop):
 
 ### MCP Tools
 
-| Tool | Description |
-|------|-------------|
-| `grph_search` | Search symbols by name, with optional kind filter |
-| `grph_node` | Return one symbol node as JSON |
-| `grph_context` | Build markdown context for an AI task description |
-| `grph_callers` | Find callers of a symbol |
-| `grph_callees` | Find callees of a symbol |
-| `grph_impact` | Analyze impact radius of changing a symbol |
-| `grph_trace` | Trace a path between two symbols |
-| `grph_explore` | Explore matching symbols with source snippets |
-| `grph_status` | Get database statistics |
-| `grph_files` | List indexed source files |
+These are the tool names returned by `tools/list` and accepted by `tools/call`:
 
-Tool arguments use snake_case for grph-specific options, such as `max_nodes` and `max_files`. `projectPath` is accepted for MCP client root selection.
+| Tool | Required arguments | Optional arguments | Description |
+|------|--------------------|--------------------|-------------|
+| `grph_search` | `query` | `kind`, `limit`, `json`, `projectPath` | Search symbols by name prefix |
+| `grph_context` | `task` | `max_nodes`, `projectPath` | Build AI context for a task |
+| `grph_callers` | `symbol` | `limit`, `projectPath` | Find what calls a symbol |
+| `grph_uncalled` | | `limit`, `json`, `projectPath` | List functions with no callers |
+| `grph_callees` | `symbol` | `limit`, `projectPath` | Find what a symbol calls |
+| `grph_impact` | `symbol` | `depth`, `projectPath` | Analyze impact radius |
+| `grph_node` | `symbol` | `projectPath` | Return one symbol node as JSON |
+| `grph_status` | | `projectPath` | Show index statistics |
+| `grph_files` | | `json`, `projectPath` | List indexed files |
+| `grph_trace` | `from`, `to` | `projectPath` | Trace a call path between two symbols |
+| `grph_explore` | `query` | `max_files`, `projectPath` | Explore symbols grouped by file |
+
+Example `tools/call` requests:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grph_search","arguments":{"query":"handle_login","limit":20}}}
+```
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"grph_callers","arguments":{"symbol":"handle_login","projectPath":"/path/to/project"}}}
+```
+
+Tool arguments use snake_case for grph-specific options, such as `max_nodes` and `max_files`. `projectPath` selects the project root when the MCP client cannot provide one through `cwd`, `rootUri`, or `workspaceFolders`.
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GRPH_MCP_TOOLS` | (all) | Comma-separated allowlist of MCP tools |
-| `GRPH_MCP_FRAME_BYTES` | `1048576` | Max MCP frame size in bytes |
+| `GRPH_MCP_FRAME_BYTES` | `1048576` | Max `Content-Length` frame size in bytes |
+| `GRPH_MCP_MAX_MESSAGE_BYTES` | `1048576` | Max newline-delimited JSON message size in bytes |
 
 `CODEGRAPH_MCP_TOOLS` is also accepted as a compatibility alias for existing client configs.
+
+## LSP Server
+
+Start the LSP server for editors that can launch a stdio language server:
+
+```bash
+grph serve --lsp
+```
+
+`grph serve --lsp` uses the current directory by default. Pass `--path /path/to/project` when the editor cannot set `cwd`. The project must already be initialized and indexed with `grph init -i`.
+
+Supported LSP features:
+
+- Document symbols
+- Go to definition
+- References
+- Hover
+- Workspace symbol search
+- Call hierarchy incoming and outgoing calls
+- Incremental sync on document save
 
 ## Project Structure
 
@@ -185,8 +224,8 @@ grph/
 │       └── resolution/  # Cross-file reference resolution
 ├── grph-cli/           # CLI binary (clap-based)
 ├── grph-mcp/           # MCP JSON-RPC server
+├── grph-lsp/           # LSP JSON-RPC server
 ├── Cargo.toml          # Workspace root
-├── STATUS.md           # Detailed status report
 └── README.md           # This file
 ```
 
@@ -198,16 +237,7 @@ grph/
 
 3. **Storage** — Nodes and edges stored in SQLite (`grph.db`). Schema includes indexes for fast symbol lookup and graph traversal.
 
-4. **MCP Transport** — JSON-RPC 2.0 over stdio with Content-Length framing and line-delimited JSON. Handles malformed frames gracefully with configurable size limits.
-
-## Status
-
-See [STATUS.md](STATUS.md) for the full status report including test results and architectural details.
-
-- **Current test pass rate:** 62/62 (100%)
-- **Build:** 0 warnings, 0 errors
-- **Core features:** Complete and tested
-- **Unresolved refs pipeline:** Cross-file resolution functional
+4. **Integration transports** — MCP and LSP both use JSON-RPC 2.0 over stdio. MCP supports Content-Length framing and line-delimited JSON, while LSP uses standard Content-Length framing.
 
 ## License
 
