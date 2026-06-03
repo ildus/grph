@@ -224,9 +224,7 @@ impl McpSession {
         if !is_tool_allowed(tool_name) {
             return tool_call_result(
                 id,
-                tools::mcp_error(format!(
-                    "Tool {tool_name} is disabled via GRPH_MCP_TOOLS"
-                )),
+                tools::mcp_error(format!("Tool {tool_name} is disabled via GRPH_MCP_TOOLS")),
             );
         }
 
@@ -303,7 +301,7 @@ fn handle_initialize(id: Option<Value>) -> Value {
             "capabilities": {
                 "tools": {"listChanged": false}
             },
-            "serverInfo": {"name": "grph-mcp", "version": "0.1.0"},
+            "serverInfo": {"name": "grph-mcp", "version": "0.2.0"},
             "instructions": SERVER_INSTRUCTIONS
         },
         "id": id

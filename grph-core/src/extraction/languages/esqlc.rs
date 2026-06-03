@@ -29,6 +29,16 @@ pub fn extract(source: &str, file_path: &str) -> Result<ExtractionResult> {
         node.language = Language::Esqlc;
     }
 
+    // The C grammar can lose statement ownership in legacy K&R-style EQUEL/C
+    // files that contain large preprocessor-heavy functions. In that case it
+    // may still find the function definition, but report an end line that is
+    // much too early and omit call edges for statements later in the function.
+    // Recompute C function extents from braces in the preprocessed source, then
+    // overlay a conservative textual call scan so callers in .qsc/.qsh files are
+    // not missed.
+    repair_function_ranges_from_braces(source, &c_source, is_quel, &mut result.nodes);
+    extract_c_call_references(source, is_quel, &mut result);
+
     // 3. SQL overlay
     extract_sql_references(source, file_path, is_quel, &mut result);
     extract_declare_section(source, file_path, &mut result);
@@ -99,6 +109,282 @@ fn strip_trailing_comment(line: &str) -> &str {
     } else {
         line
     }
+}
+
+/// Repair function end lines by counting braces in the C-compatible source.
+///
+/// Tree-sitter can recover from legacy embedded-C syntax by producing a
+/// function_definition node with a truncated range. Later call extraction relies
+/// on accurate ranges to determine the enclosing caller, so prefer the brace
+/// extent when it clearly encloses more source than the parser reported.
+fn repair_function_ranges_from_braces(
+    source: &str,
+    c_source: &str,
+    is_quel: bool,
+    nodes: &mut [Node],
+) {
+    let source_lines: Vec<&str> = source.lines().collect();
+    let c_lines: Vec<&str> = c_source.lines().collect();
+
+    for node in nodes.iter_mut() {
+        if node.kind != NodeKind::Function && node.kind != NodeKind::Method {
+            continue;
+        }
+
+        let start_idx = node.start_line.saturating_sub(1) as usize;
+        if start_idx >= source_lines.len() {
+            continue;
+        }
+
+        let search_end = (start_idx + 80).min(source_lines.len());
+        let Some(open_idx) = (start_idx..search_end).find(|&idx| {
+            line_has_body_open_brace(source_lines[idx], c_lines.get(idx).copied(), is_quel)
+        }) else {
+            continue;
+        };
+
+        let mut depth: i32 = 0;
+        let mut saw_open = false;
+        for (idx, line) in source_lines.iter().enumerate().skip(open_idx) {
+            for ch in brace_scan_line(line, c_lines.get(idx).copied(), is_quel).chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        saw_open = true;
+                    }
+                    '}' if saw_open => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let end_line = (idx + 1) as u32;
+                            if end_line > node.end_line {
+                                node.end_line = end_line;
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if saw_open && depth == 0 {
+                break;
+            }
+        }
+    }
+}
+
+fn line_has_body_open_brace(source_line: &str, c_line: Option<&str>, is_quel: bool) -> bool {
+    if strip_c_line_noise(c_line.unwrap_or(source_line)).contains('{') {
+        return true;
+    }
+
+    is_quel && source_line.trim_start().starts_with("##{")
+}
+
+fn brace_scan_line(source_line: &str, c_line: Option<&str>, is_quel: bool) -> String {
+    if is_quel {
+        let trimmed = source_line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("##") {
+            if rest.trim() == "{" || rest.trim() == "}" {
+                return rest.to_string();
+            }
+        }
+    }
+
+    strip_c_line_noise(c_line.unwrap_or(source_line))
+}
+
+/// Remove enough comments/string literals for simple brace and call scanning.
+/// This intentionally preserves line-local code and does not try to be a full C
+/// lexer; it is used only as an overlay after tree-sitter extraction.
+fn strip_c_line_noise(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if let Some(quote) = in_string {
+            if escaped {
+                escaped = false;
+                out.push(' ');
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                out.push(' ');
+                continue;
+            }
+            if ch == quote {
+                in_string = None;
+            }
+            out.push(' ');
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' {
+            in_string = Some(ch);
+            out.push(' ');
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'/') {
+            break;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            break;
+        }
+        out.push(ch);
+    }
+
+    out
+}
+
+/// Add call edges found textually in embedded C source.
+///
+/// This complements the C parser for `.sc`, `.qsc`, and `.qsh` files. In
+/// particular, historical EQUEL/C uses K&R function definitions plus `##` QUEL
+/// lines; parser recovery may skip ordinary C calls after preprocessor branches.
+fn extract_c_call_references(source: &str, is_quel: bool, result: &mut ExtractionResult) {
+    let re = match Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(") {
+        Ok(re) => re,
+        Err(_) => return,
+    };
+
+    let lines: Vec<&str> = source.lines().collect();
+    let mut seen: HashSet<(String, String, u32)> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Calls)
+        .map(|edge| {
+            (
+                edge.source.clone(),
+                edge.target.clone(),
+                edge.line.unwrap_or(0),
+            )
+        })
+        .collect();
+
+    for (i, line) in lines.iter().enumerate() {
+        let line_num = (i + 1) as u32;
+        let trimmed = line.trim_start();
+
+        if trimmed.is_empty()
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+            || trimmed.starts_with("//")
+            || trimmed.starts_with('#')
+            || (is_quel && trimmed.starts_with("##"))
+            || line_starts_exec_sql(line)
+            || looks_like_c_declaration(trimmed)
+        {
+            continue;
+        }
+
+        let Some(caller_id) = resolve_owner_node(line_num, &result.nodes) else {
+            continue;
+        };
+
+        let code = strip_c_line_noise(line);
+        for caps in re.captures_iter(&code) {
+            let name = match caps.get(1) {
+                Some(m) => m.as_str(),
+                None => continue,
+            };
+
+            if is_c_call_noise(name) {
+                continue;
+            }
+
+            let key = (caller_id.clone(), name.to_string(), line_num);
+            if !seen.insert(key) {
+                continue;
+            }
+
+            result.edges.push(Edge {
+                source: caller_id.clone(),
+                target: name.to_string(),
+                kind: EdgeKind::Calls,
+                metadata: None,
+                line: Some(line_num),
+                col: caps.get(1).map(|m| m.start() as u32),
+                provenance: Some("esqlc-call-overlay".to_string()),
+            });
+        }
+    }
+}
+
+fn looks_like_c_declaration(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("typedef ")
+        || lower.starts_with("struct ")
+        || lower.starts_with("enum ")
+        || lower.starts_with("union ")
+        || lower.starts_with("extern ")
+        || lower.starts_with("static ") && !trimmed.contains('(')
+    {
+        return true;
+    }
+
+    // K&R parameter declaration lines and prototypes/declarations that begin
+    // with common C/Ingres scalar types. Calls in expressions generally do not
+    // start with a type keyword.
+    const TYPE_PREFIXES: &[&str] = &[
+        "void",
+        "char",
+        "int",
+        "float",
+        "double",
+        "long",
+        "short",
+        "unsigned",
+        "signed",
+        "bool",
+        "size_t",
+        "i1",
+        "i2",
+        "i4",
+        "i8",
+        "u_i1",
+        "u_i2",
+        "u_i4",
+        "nat",
+        "i4nat",
+        "f4",
+        "f8",
+        "status",
+        "db_status",
+        "ptr",
+    ];
+
+    TYPE_PREFIXES.iter().any(|prefix| {
+        lower == *prefix
+            || lower.starts_with(&format!("{prefix} "))
+            || lower.starts_with(&format!("{prefix}\t"))
+            || lower.starts_with(&format!("{prefix}*"))
+    })
+}
+
+fn is_c_call_noise(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "for"
+            | "while"
+            | "switch"
+            | "return"
+            | "sizeof"
+            | "defined"
+            | "case"
+            | "do"
+            | "else"
+            | "VOID"
+            | "void"
+            | "char"
+            | "int"
+            | "float"
+            | "double"
+            | "long"
+            | "short"
+            | "bool"
+    )
 }
 
 // ── SQL overlay ─────────────────────────────────────────────────────────

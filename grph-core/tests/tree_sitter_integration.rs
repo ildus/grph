@@ -252,6 +252,62 @@ int main() { greet("world"); return 0; }
 }
 
 #[test]
+fn extracts_esqlc_qsc_calls_after_legacy_knr_recovery() {
+    let source = r#"
+void
+tu_main(argc, argv)
+int argc;
+char **argv;
+{
+    if (argc > 1)
+    {
+        helper(argc);
+    }
+}
+
+VOID
+legacy_driver(is_table, owndottbl, nrmltblname)
+i4      is_table;
+char    *owndottbl;
+char    *nrmltblname;
+{
+#ifdef VMS
+    if (owndottbl[0] != '\0')
+    {
+        helper(owndottbl);
+    }
+#else
+    helper(nrmltblname);
+#endif
+    some_legacy_func( 1, is_table, owndottbl );
+    some_legacy_func(1, is_table, nrmltblname);
+}
+"#;
+    let result =
+        extract_for_language(Language::Esqlc, source, "example.qsc").unwrap();
+
+    let legacy = result
+        .nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::Function && node.name == "legacy_driver")
+        .expect("legacy K&R function should be extracted");
+    assert!(
+        legacy.end_line >= 28,
+        "legacy function range should be repaired to include late statements: {legacy:?}"
+    );
+
+    let mqbf_calls: Vec<_> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Calls && edge.target == "some_legacy_func")
+        .collect();
+    assert_eq!(mqbf_calls.len(), 2, "edges: {:#?}", result.edges);
+    assert!(mqbf_calls.iter().all(|edge| edge.source == legacy.id));
+    assert!(mqbf_calls.iter().any(|edge| edge.line == Some(27)));
+    assert!(mqbf_calls.iter().any(|edge| edge.line == Some(28)));
+}
+
+#[test]
 fn extracts_shell_tree_sitter_symbols_calls_and_imports() {
     let source = r#"
 #!/usr/bin/env bash
