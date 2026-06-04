@@ -8,7 +8,41 @@ struct Migration {
 }
 
 // Add migrations here as the schema evolves
-const MIGRATIONS: &[Migration] = &[];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 2,
+        description: "Add file source full-text search index",
+        sql: r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+    path UNINDEXED,
+    content
+);
+"#,
+    },
+    Migration {
+        version: 3,
+        description: "Add resolver attempted markers and performance indexes",
+        sql: r#"
+ALTER TABLE unresolved_refs ADD COLUMN resolution_status TEXT;
+ALTER TABLE unresolved_refs ADD COLUMN resolution_attempted_at INTEGER;
+CREATE INDEX IF NOT EXISTS idx_unresolved_group
+ON unresolved_refs(reference_name, reference_kind, file_path, language);
+CREATE INDEX IF NOT EXISTS idx_unresolved_pending_group
+ON unresolved_refs(resolution_status, reference_name, reference_kind, file_path, language);
+CREATE INDEX IF NOT EXISTS idx_edges_target_kind_source
+ON edges(target, kind, source);
+"#,
+    },
+    Migration {
+        version: 4,
+        description: "Add unresolved resolution reason",
+        sql: r#"
+ALTER TABLE unresolved_refs ADD COLUMN resolution_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_unresolved_status_reason
+ON unresolved_refs(resolution_status, resolution_reason);
+"#,
+    },
+];
 
 pub fn run_migrations(db: &Database) -> Result<()> {
     let current_version = get_schema_version(db)?;

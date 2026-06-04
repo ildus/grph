@@ -283,8 +283,7 @@ char    *nrmltblname;
     some_legacy_func(1, is_table, nrmltblname);
 }
 "#;
-    let result =
-        extract_for_language(Language::Esqlc, source, "example.qsc").unwrap();
+    let result = extract_for_language(Language::Esqlc, source, "example.qsc").unwrap();
 
     let legacy = result
         .nodes
@@ -1196,6 +1195,103 @@ fn scan_files_skips_build_output_directories() {
     assert!(
         rels.iter().all(|path| !path.starts_with("target/")),
         "rels={rels:?}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn c_builtin_and_macro_like_refs_are_not_queued_for_resolution() {
+    use grph_core::Grph;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("grph-c-builtins-{stamp}"));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("main.c"),
+        r#"
+#include <stdio.h>
+#define ASSERT(x) ((void)0)
+#define ERx(x) (x)
+
+void local_helper(void) {}
+
+void run(void) {
+    printf("%s", ERx("ok"));
+    ASSERT(1);
+    local_helper();
+}
+"#,
+    )
+    .unwrap();
+
+    let mut grph = Grph::init(&dir).unwrap();
+    grph.index(|_| {}).unwrap();
+
+    let unresolved = grph.db().get_unresolved_refs(1000).unwrap();
+    let names: Vec<_> = unresolved
+        .iter()
+        .map(|r| r.reference_name.as_str())
+        .collect();
+    assert!(!names.contains(&"printf"), "unresolved: {names:?}");
+    assert!(!names.contains(&"ASSERT"), "unresolved: {names:?}");
+    assert!(!names.contains(&"ERx"), "unresolved: {names:?}");
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn c_platform_resolution_prefers_unix_win_implementation() {
+    use grph_core::Grph;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("grph-c-platform-resolution-{stamp}"));
+    fs::create_dir_all(dir.join("zorp/zlf/zq_unix_win")).unwrap();
+    fs::create_dir_all(dir.join("zorp/zlf/zq_vms")).unwrap();
+    fs::create_dir_all(dir.join("back/dmf/dmd")).unwrap();
+
+    fs::write(
+        dir.join("zorp/zlf/zq_unix_win/zq.c"),
+        "int ZQrender(const char *fc, ...) { return 0; }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("zorp/zlf/zq_vms/zq.c"),
+        "int ZQrender(const char *fc, ...) { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("back/dmf/dmd/dmdcb.c"),
+        "int run(void) { return ZQrender(\"x\"); }\n",
+    )
+    .unwrap();
+
+    let mut grph = Grph::init(&dir).unwrap();
+    grph.index(|_| {}).unwrap();
+
+    let run = grph.db().get_node_by_name_any("run").unwrap().unwrap();
+    let callees = grph.traverser().callees(&run.id, 20).unwrap();
+    assert!(
+        callees.iter().any(|(node, _)| {
+            node.name == "ZQrender" && node.file_path == "zorp/zlf/zq_unix_win/zq.c"
+        }),
+        "{callees:?}"
+    );
+    assert!(
+        !callees.iter().any(|(node, _)| {
+            node.name == "ZQrender" && node.file_path == "zorp/zlf/zq_vms/zq.c"
+        }),
+        "{callees:?}"
     );
 
     fs::remove_dir_all(dir).ok();

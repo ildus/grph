@@ -493,6 +493,132 @@ fn mcp_explore_falls_back_to_individual_query_terms() {
 }
 
 #[test]
+fn explore_output_budget_matches_codegraph_tiers() {
+    use grph_mcp::budget::{explore_budget, explore_output_budget};
+
+    let small = explore_output_budget(100);
+    let huge = explore_output_budget(30_000);
+    assert!(small.max_chars < huge.max_chars);
+    assert!(small.max_files < huge.max_files);
+    assert!(small.max_chars_per_file < huge.max_chars_per_file);
+    assert!(small.max_chars <= 20_000);
+    assert!(explore_output_budget(10_000).max_chars >= 35_000);
+
+    assert_eq!(
+        explore_output_budget(50).max_chars,
+        explore_output_budget(499).max_chars
+    );
+    assert_eq!(explore_budget(50), explore_budget(499));
+    assert_eq!(
+        explore_output_budget(500).max_chars,
+        explore_output_budget(4_999).max_chars
+    );
+    assert_eq!(explore_budget(500), explore_budget(4_999));
+    assert_ne!(
+        explore_output_budget(499).max_chars,
+        explore_output_budget(500).max_chars
+    );
+    assert_ne!(
+        explore_output_budget(4_999).max_chars,
+        explore_output_budget(5_000).max_chars
+    );
+
+    assert!(!small.include_additional_files);
+    assert!(!small.include_completeness_signal);
+    assert!(!small.include_budget_note);
+    assert!(small.include_relationships);
+    assert!(explore_output_budget(1_000).include_budget_note);
+    assert!(small.max_symbols_in_file_header < huge.max_symbols_in_file_header);
+    assert!(small.gap_threshold <= huge.gap_threshold);
+}
+
+#[test]
+fn mcp_explore_returns_bounded_line_numbered_source_clusters() {
+    let _env = env_lock();
+    let dir = temp_project("explore-source-budget");
+    let mut session = String::from("class Session:\n");
+    for i in 0..30 {
+        session.push_str(&format!(
+            "    def method{0}(self, arg):\n        return self.helper{0}(arg) + '{0}'\n\n    def helper{0}(self, arg):\n        return arg * {1}\n\n",
+            i,
+            i + 1
+        ));
+    }
+    fs::write(dir.join("session.py"), session).unwrap();
+    fs::write(
+        dir.join("support.py"),
+        "from session import Session\n\ndef call_session(s: Session):\n    return s.method1('hi')\n",
+    )
+    .unwrap();
+    let mut grph = Grph::init(&dir).unwrap();
+    grph.index(|_| {}).unwrap();
+
+    let response = grph_mcp::transport::handle_message(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grph_explore","arguments":{"query":"Session method helper","max_files":10}}}"#,
+        &dir,
+    );
+    let value = parse_response(&response);
+    let text = value["result"]["content"][0]["text"].as_str().unwrap();
+
+    assert!(
+        text.len() <= grph_mcp::budget::explore_output_budget(100).max_chars + 500,
+        "{}",
+        text.len()
+    );
+    assert!(text.contains("### Source Code"), "{text}");
+    assert!(text.contains("session.py"), "{text}");
+    assert!(text.contains("method"), "{text}");
+    assert!(text.contains("helper"), "{text}");
+    assert!(
+        text.contains("\n1\t") || text.contains("\n2\t") || text.contains("\n3\t"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Complete source code is included above"),
+        "{text}"
+    );
+    assert!(!text.contains("Explore budget:"), "{text}");
+    assert!(!text.contains("### Additional relevant files"), "{text}");
+    assert!(!text.contains("// ..."), "{text}");
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn mcp_context_uses_content_fallback_for_natural_language_terms() {
+    let _env = env_lock();
+    let dir = temp_project("context-content-fallback");
+    fs::write(
+        dir.join("billing.py"),
+        r#"
+def reconcile_account(record):
+    # Handles invoice mismatch recovery for imported ledger rows.
+    if record.get('status') == 'invoice mismatch':
+        return 'needs-review'
+    return 'ok'
+"#,
+    )
+    .unwrap();
+    let mut grph = Grph::init(&dir).unwrap();
+    grph.index(|_| {}).unwrap();
+
+    let response = grph_mcp::transport::handle_message(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grph_context","arguments":{"task":"debug invoice mismatch recovery","max_nodes":10}}}"#,
+        &dir,
+    );
+    let value = parse_response(&response);
+    let text = value["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("reconcile_account"), "{text}");
+    assert!(
+        text.contains("content match") || text.contains("invoice mismatch"),
+        "{text}"
+    );
+    assert!(text.contains("## Code Context"), "{text}");
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn mcp_impact_lists_affected_symbols_grouped_by_file() {
     let _env = env_lock();
     let dir = temp_project("impact-output");
@@ -524,6 +650,160 @@ def top():
     assert!(response.contains("top"), "{response}");
     assert!(response.contains("main.py"), "{response}");
     assert!(!response.contains("Nodes:"), "{response}");
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn mcp_node_include_code_returns_leaf_source_and_container_outline() {
+    let _env = env_lock();
+    let dir = temp_project("node-include-code");
+    fs::write(
+        dir.join("service.py"),
+        r#"
+class PaymentService:
+    def authorize(self, amount):
+        return amount > 0
+
+    def capture(self, amount):
+        return self.authorize(amount)
+
+def make_service():
+    return PaymentService()
+"#,
+    )
+    .unwrap();
+    let mut grph = Grph::init(&dir).unwrap();
+    grph.index(|_| {}).unwrap();
+
+    let leaf = grph_mcp::transport::handle_message(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grph_node","arguments":{"symbol":"make_service","includeCode":true}}}"#,
+        &dir,
+    );
+    let value = parse_response(&leaf);
+    let text = value["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("### Source"), "{text}");
+    assert!(text.contains("return PaymentService"), "{text}");
+    assert!(text.contains("	"), "{text}");
+
+    let container = grph_mcp::transport::handle_message(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"grph_node","arguments":{"symbol":"PaymentService","includeCode":true}}}"#,
+        &dir,
+    );
+    let value = parse_response(&container);
+    let text = value["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("### Structure"), "{text}");
+    assert!(text.contains("authorize"), "{text}");
+    assert!(text.contains("capture"), "{text}");
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn content_fts_is_populated_and_searchable() {
+    let _env = env_lock();
+    let dir = temp_project("content-fts");
+    fs::write(
+        dir.join("billing.py"),
+        "def reconcile_account(record):
+    # invoice mismatch recovery path
+    return record
+",
+    )
+    .unwrap();
+    let mut grph = Grph::init(&dir).unwrap();
+    grph.index(|_| {}).unwrap();
+
+    let hits = grph
+        .db()
+        .search_file_contents("invoice mismatch recovery", 5)
+        .unwrap();
+    assert!(
+        hits.iter().any(|(path, _)| path == "billing.py"),
+        "{hits:?}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn generic_callback_synthesis_connects_runtime_callback_to_handler() {
+    let _env = env_lock();
+    let dir = temp_project("generic-callback");
+    fs::write(
+        dir.join("callbacks.ts"),
+        r#"
+function handleTick() {
+  return 1;
+}
+
+function startTimer() {
+  setTimeout(handleTick, 10);
+}
+"#,
+    )
+    .unwrap();
+    let mut grph = Grph::init(&dir).unwrap();
+    grph.index(|_| {}).unwrap();
+    let start = grph
+        .db()
+        .get_node_by_name_any("startTimer")
+        .unwrap()
+        .unwrap();
+    let callees = grph.traverser().callees(&start.id, 20).unwrap();
+    assert!(
+        callees.iter().any(|(node, edge)| {
+            node.name == "handleTick" && edge.provenance.as_deref() == Some("heuristic")
+        }),
+        "{callees:?}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn import_aware_resolution_prefers_imported_symbol_over_same_named_symbol_elsewhere() {
+    let _env = env_lock();
+    let dir = temp_project("import-aware-resolution");
+    fs::write(
+        dir.join("a.py"),
+        "def target():
+    return 'a'
+",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("b.py"),
+        "def target():
+    return 'b'
+",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("main.py"),
+        "from b import target
+
+def run():
+    return target()
+",
+    )
+    .unwrap();
+    let mut grph = Grph::init(&dir).unwrap();
+    grph.index(|_| {}).unwrap();
+    let run = grph.db().get_node_by_name_any("run").unwrap().unwrap();
+    let callees = grph.traverser().callees(&run.id, 20).unwrap();
+    assert!(
+        callees
+            .iter()
+            .any(|(node, _)| node.name == "target" && node.file_path == "b.py"),
+        "{callees:?}"
+    );
+    assert!(
+        !callees
+            .iter()
+            .any(|(node, _)| node.name == "target" && node.file_path == "a.py"),
+        "{callees:?}"
+    );
 
     fs::remove_dir_all(dir).ok();
 }

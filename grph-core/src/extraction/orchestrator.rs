@@ -3,8 +3,9 @@ use crate::errors::{GrphError, Result};
 use crate::extraction::grammars::{detect_language, detect_language_with_content};
 use crate::extraction::languages::extract_for_language;
 use crate::extraction::tree_sitter::ExtractionResult;
+use crate::resolution::builtins::is_builtin;
 use crate::types::{
-    Edge, EdgeKind, FileRecord, IndexProgress, IndexResult, Language, Node, SyncResult,
+    Edge, EdgeKind, FileRecord, IndexProgress, IndexResult, Language, Node, NodeKind, SyncResult,
     UnresolvedRef,
 };
 use ignore::WalkBuilder;
@@ -15,8 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAX_FILE_SIZE: u64 = 1_000_000; // 1MB
+const MAX_FILE_SIZE: u64 = 20_000_000; // 20MB
 const INDEX_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+const STORE_BATCH_SIZE: usize = 256;
 
 fn should_skip_path(relative_path: &str) -> bool {
     relative_path.split('/').any(|part| {
@@ -102,14 +104,65 @@ impl ExtractionOrchestrator {
         jobs: usize,
         progress: impl Fn(IndexProgress),
     ) -> Result<IndexResult> {
-        let files = self.scan_files()?;
+        self.index_all_with_jobs_and_force(jobs, false, progress)
+    }
+
+    pub fn index_all_with_jobs_and_force(
+        &mut self,
+        jobs: usize,
+        force: bool,
+        progress: impl Fn(IndexProgress),
+    ) -> Result<IndexResult> {
+        let scanned_files = self.scan_files()?;
+        if force {
+            self.db.clear_graph_for_reindex()?;
+        } else {
+            self.prune_unscanned_files(&scanned_files)?;
+        }
+        let files = self.changed_index_files(&scanned_files, force)?;
         let total = files.len() as u64;
 
+        if files.is_empty() {
+            progress(IndexProgress {
+                current: 0,
+                total,
+                phase: "complete".to_string(),
+                current_file: None,
+                parsed: 0,
+                stored: 0,
+            });
+            return Ok(IndexResult {
+                files_indexed: 0,
+                nodes_created: 0,
+                edges_created: 0,
+            });
+        }
+
+        let defer_node_fts = force || files.len() >= 128;
+        if defer_node_fts {
+            self.db.disable_node_fts_triggers()?;
+        }
+
+        let index_result = self.index_changed_files(files, jobs, total, progress);
+        if defer_node_fts {
+            if index_result.is_ok() {
+                self.db.rebuild_nodes_fts()?;
+            }
+            self.db.recreate_node_fts_triggers()?;
+        }
+        index_result
+    }
+
+    fn index_changed_files(
+        &mut self,
+        files: Vec<PathBuf>,
+        jobs: usize,
+        total: u64,
+        progress: impl Fn(IndexProgress),
+    ) -> Result<IndexResult> {
         let mut total_nodes = 0u64;
         let mut total_edges = 0u64;
         let mut files_indexed = 0u64;
-
-        self.prune_unscanned_files(&files)?;
 
         let jobs = jobs.max(1).min(files.len().max(1));
         if jobs == 1 || files.len() <= 1 {
@@ -121,6 +174,8 @@ impl ExtractionOrchestrator {
                     total,
                     phase: "parsing".to_string(),
                     current_file: Some(relative_path.clone()),
+                    parsed: i as u64,
+                    stored: files_indexed,
                 });
 
                 let language = detect_language(file_path).ok_or_else(|| {
@@ -144,6 +199,8 @@ impl ExtractionOrchestrator {
                 total,
                 phase: "complete".to_string(),
                 current_file: None,
+                parsed: total,
+                stored: files_indexed,
             });
 
             return Ok(IndexResult {
@@ -191,42 +248,89 @@ impl ExtractionOrchestrator {
         }
         drop(job_tx);
 
+        let mut store_batch = Vec::with_capacity(STORE_BATCH_SIZE);
+        let mut parsed_count = 0u64;
+        let mut stored_count = 0u64;
         for i in 0..files.len() {
             match result_rx.recv() {
                 Ok(Ok(Some(parsed))) => {
+                    parsed_count = i as u64 + 1;
                     progress(IndexProgress {
-                        current: i as u64 + 1,
+                        current: parsed_count,
                         total,
-                        phase: "storing".to_string(),
+                        phase: "parsed".to_string(),
                         current_file: Some(parsed.relative_path.clone()),
+                        parsed: parsed_count,
+                        stored: stored_count,
                     });
-                    match self.store_extraction(parsed) {
-                        Ok((nodes, edges)) => {
-                            total_nodes += nodes as u64;
-                            total_edges += edges as u64;
-                            files_indexed += 1;
+                    store_batch.push(parsed);
+                    if store_batch.len() >= STORE_BATCH_SIZE {
+                        let batch = std::mem::take(&mut store_batch);
+                        match self.store_extractions_batch_with_progress(batch, |path| {
+                            stored_count += 1;
+                            progress(IndexProgress {
+                                current: stored_count,
+                                total,
+                                phase: "storing".to_string(),
+                                current_file: Some(path.to_string()),
+                                parsed: parsed_count,
+                                stored: stored_count,
+                            });
+                        }) {
+                            Ok((files, nodes, edges)) => {
+                                files_indexed += files as u64;
+                                total_nodes += nodes as u64;
+                                total_edges += edges as u64;
+                            }
+                            Err(e) => eprintln!("WARN: Failed to store parsed batch: {}", e),
                         }
-                        Err(e) => eprintln!("WARN: Failed to store parsed file: {}", e),
                     }
                 }
                 Ok(Ok(None)) => {
+                    parsed_count = i as u64 + 1;
                     progress(IndexProgress {
-                        current: i as u64 + 1,
+                        current: parsed_count,
                         total,
                         phase: "skipping".to_string(),
                         current_file: None,
+                        parsed: parsed_count,
+                        stored: stored_count,
                     });
                 }
                 Ok(Err((path, e))) => {
+                    parsed_count = i as u64 + 1;
                     progress(IndexProgress {
-                        current: i as u64 + 1,
+                        current: parsed_count,
                         total,
                         phase: "parsing".to_string(),
                         current_file: Some(path.clone()),
+                        parsed: parsed_count,
+                        stored: stored_count,
                     });
                     eprintln!("WARN: Failed to parse {}: {}", path, e);
                 }
                 Err(e) => return Err(GrphError::Extraction(format!("Index worker failed: {e}"))),
+            }
+        }
+
+        if !store_batch.is_empty() {
+            match self.store_extractions_batch_with_progress(store_batch, |path| {
+                stored_count += 1;
+                progress(IndexProgress {
+                    current: stored_count,
+                    total,
+                    phase: "storing".to_string(),
+                    current_file: Some(path.to_string()),
+                    parsed: parsed_count,
+                    stored: stored_count,
+                });
+            }) {
+                Ok((files, nodes, edges)) => {
+                    files_indexed += files as u64;
+                    total_nodes += nodes as u64;
+                    total_edges += edges as u64;
+                }
+                Err(e) => eprintln!("WARN: Failed to store final parsed batch: {}", e),
             }
         }
 
@@ -235,6 +339,8 @@ impl ExtractionOrchestrator {
             total,
             phase: "complete".to_string(),
             current_file: None,
+            parsed: parsed_count,
+            stored: stored_count,
         });
 
         Ok(IndexResult {
@@ -242,6 +348,30 @@ impl ExtractionOrchestrator {
             nodes_created: total_nodes,
             edges_created: total_edges,
         })
+    }
+
+    fn changed_index_files(&self, files: &[PathBuf], force: bool) -> Result<Vec<PathBuf>> {
+        if force {
+            return Ok(files.to_vec());
+        }
+        let mut out = Vec::new();
+        for file_path in files {
+            let rel_path = relative_path(&self.project_root, file_path);
+            let info = match source_file_info(file_path) {
+                Ok(info) => info,
+                Err(e) => {
+                    eprintln!("WARN: Failed to stat {}: {}", file_path.display(), e);
+                    continue;
+                }
+            };
+            if let Some(existing) = self.db.get_file(&rel_path)? {
+                if existing.size == info.size && existing.modified_at >= info.modified_at {
+                    continue;
+                }
+            }
+            out.push(file_path.clone());
+        }
+        Ok(out)
     }
 
     fn prune_unscanned_files(&self, files: &[PathBuf]) -> Result<()> {
@@ -531,24 +661,72 @@ impl ExtractionOrchestrator {
     }
 
     fn store_extraction(&mut self, parsed: ParsedFile) -> Result<(usize, usize)> {
-        let relative_path = parsed.relative_path;
-        let language = parsed.language;
-        let content = parsed.content;
-        let extraction = parsed.extraction;
-        let info = parsed.info;
-        let node_count = extraction.nodes.len();
-        let edge_count = extraction.edges.len();
+        let (_, nodes, edges) = self.store_extractions_batch(vec![parsed])?;
+        Ok((nodes, edges))
+    }
 
-        // Re-indexing the same file must replace its old graph fragment.
-        self.db.delete_file_nodes(&relative_path)?;
-        self.db.delete_unresolved_refs_for_file(&relative_path)?;
+    fn store_extractions_batch(&mut self, batch: Vec<ParsedFile>) -> Result<(usize, usize, usize)> {
+        self.store_extractions_batch_with_progress(batch, |_| {})
+    }
 
-        // Wrap the entire file update in a single transaction. Without this,
-        // SQLite auto-commits after every INSERT — one fsync per row. For a
-        // typical file with 50 nodes + 30 edges that's 80 fsyncs instead of 1.
+    fn store_extractions_batch_with_progress(
+        &mut self,
+        batch: Vec<ParsedFile>,
+        mut on_file_stored: impl FnMut(&str),
+    ) -> Result<(usize, usize, usize)> {
+        if batch.is_empty() {
+            return Ok((0, 0, 0));
+        }
+
         self.db
             .conn()
             .execute_batch("PRAGMA foreign_keys = OFF; BEGIN TRANSACTION")?;
+
+        let mut files = 0usize;
+        let mut nodes = 0usize;
+        let mut edges = 0usize;
+        for parsed in batch {
+            let path = parsed.relative_path.clone();
+            match self.store_extraction_in_transaction(parsed) {
+                Ok((n, e)) => {
+                    files += 1;
+                    nodes += n;
+                    edges += e;
+                    on_file_stored(&path);
+                }
+                Err(err) => {
+                    let _ = self
+                        .db
+                        .conn()
+                        .execute_batch("ROLLBACK; PRAGMA foreign_keys = ON");
+                    return Err(err);
+                }
+            }
+        }
+
+        self.db
+            .conn()
+            .execute_batch("COMMIT; PRAGMA foreign_keys = ON")?;
+        Ok((files, nodes, edges))
+    }
+
+    fn store_extraction_in_transaction(&mut self, parsed: ParsedFile) -> Result<(usize, usize)> {
+        let relative_path = parsed.relative_path;
+        let language = parsed.language;
+        let content = parsed.content;
+        let mut extraction = parsed.extraction;
+        let info = parsed.info;
+        Self::synthesize_generic_callback_edges(
+            &mut extraction.edges,
+            &extraction.nodes,
+            &content,
+            language,
+        );
+        let node_count = extraction.nodes.len();
+        let edge_count = extraction.edges.len();
+
+        self.db.delete_file_nodes(&relative_path)?;
+        self.db.delete_unresolved_refs_for_file(&relative_path)?;
 
         for node in &extraction.nodes {
             self.db.insert_node(node)?;
@@ -558,12 +736,11 @@ impl ExtractionOrchestrator {
             self.db.insert_edge(edge)?;
         }
 
-        // Capture unresolved references: edges whose targets are still bare names
-        // (couldn't be resolved to node IDs during local resolution). These will
-        // be resolved cross-file by the post-indexing resolution pass.
         let node_ids: HashSet<&str> = extraction.nodes.iter().map(|n| n.id.as_str()).collect();
         for edge in &extraction.edges {
-            if !node_ids.contains(edge.target.as_str()) {
+            if !node_ids.contains(edge.target.as_str())
+                && should_track_unresolved_reference(&edge.target, edge.kind, language)
+            {
                 let unresolved = UnresolvedRef {
                     id: None,
                     from_node_id: edge.source.clone(),
@@ -581,11 +758,6 @@ impl ExtractionOrchestrator {
             }
         }
 
-        self.db
-            .conn()
-            .execute_batch("COMMIT; PRAGMA foreign_keys = ON")?;
-
-        // Update file record
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -607,6 +779,8 @@ impl ExtractionOrchestrator {
         };
 
         self.db.insert_file(&file_record)?;
+        self.db
+            .upsert_file_content_fts(&file_record.path, &content)?;
 
         Ok((node_count, edge_count))
     }
@@ -658,11 +832,186 @@ impl ExtractionOrchestrator {
         }
     }
 
+    /// Synthesize non-framework dynamic dispatch edges for common language/runtime
+    /// callback patterns. These are deliberately generic (setTimeout, Promise.then,
+    /// Array.map/filter, EventEmitter-style .on, Python Thread(target=...), Go
+    /// HandleFunc/go/defer, C signal) and marked heuristic so callers can explain
+    /// that the edge is inferred rather than a direct lexical call.
+    fn synthesize_generic_callback_edges(
+        edges: &mut Vec<Edge>,
+        nodes: &[Node],
+        content: &str,
+        language: Language,
+    ) {
+        let callable_by_name: HashMap<&str, &Node> = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Function | NodeKind::Method))
+            .map(|n| (n.name.as_str(), n))
+            .collect();
+        if callable_by_name.is_empty() {
+            return;
+        }
+        let file_node = nodes.iter().find(|n| n.kind == NodeKind::File);
+
+        let patterns: &[&str] = match language {
+            Language::JavaScript | Language::TypeScript | Language::Jsx | Language::Tsx => &[
+                r"\b(?:setTimeout|setInterval|queueMicrotask)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)",
+                r"\.(?:then|catch|finally|map|filter|forEach|some|every|find)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)",
+                r#"\.(?:on|once|addEventListener)\s*\(\s*['"][^'"]+['"]\s*,\s*([A-Za-z_][A-Za-z0-9_]*)"#,
+            ],
+            Language::Python => &[
+                r"\bthreading\.Thread\s*\([^\n)]*target\s*=\s*([A-Za-z_][A-Za-z0-9_]*)",
+                r"\batexit\.register\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)",
+                r"\b(?:map|filter)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)",
+                r"\bsorted\s*\([^\n)]*key\s*=\s*([A-Za-z_][A-Za-z0-9_]*)",
+            ],
+            Language::Go => &[
+                r"\bhttp\.HandleFunc\s*\(\s*[^,]+,\s*([A-Za-z_][A-Za-z0-9_]*)",
+                r"\bgo\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                r"\bdefer\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+            ],
+            Language::Rust => &[
+                r"\.(?:map|filter|for_each|find|any|all)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)",
+                r"\bthread::spawn\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)",
+            ],
+            Language::C | Language::Cpp => &[
+                r"\bsignal\s*\(\s*[^,]+,\s*([A-Za-z_][A-Za-z0-9_]*)",
+                r"\bpthread_create\s*\([^\n)]*,\s*[^,]+,\s*([A-Za-z_][A-Za-z0-9_]*)",
+            ],
+            _ => &[],
+        };
+
+        let mut existing = HashSet::new();
+        for edge in edges.iter() {
+            existing.insert((edge.source.clone(), edge.target.clone(), edge.kind.as_str()));
+        }
+
+        for pattern in patterns {
+            let Ok(re) = regex::Regex::new(pattern) else {
+                continue;
+            };
+            for caps in re.captures_iter(content) {
+                let Some(m) = caps.get(1) else { continue };
+                let callback_name = m.as_str();
+                let Some(target) = callable_by_name.get(callback_name) else {
+                    continue;
+                };
+                let line = byte_to_line(content, m.start());
+                let Some(source) = innermost_node_at_line(nodes, line).or(file_node) else {
+                    continue;
+                };
+                if source.id == target.id {
+                    continue;
+                }
+                if !existing.insert((
+                    source.id.clone(),
+                    target.id.clone(),
+                    EdgeKind::Calls.as_str(),
+                )) {
+                    continue;
+                }
+                edges.push(Edge {
+                    source: source.id.clone(),
+                    target: target.id.clone(),
+                    kind: EdgeKind::Calls,
+                    metadata: Some(serde_json::json!({
+                        "synthesizedBy": "generic-callback",
+                        "via": callback_name,
+                        "registeredAt": format!("{}:{}", source.file_path, line),
+                    })),
+                    line: Some(line),
+                    col: Some(0),
+                    provenance: Some("heuristic".to_string()),
+                });
+            }
+        }
+    }
+
     pub fn hash_content(content: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         hex::encode(hasher.finalize())
     }
+}
+
+fn should_track_unresolved_reference(target: &str, kind: EdgeKind, language: Language) -> bool {
+    if target.is_empty() || is_builtin(target, language) {
+        return false;
+    }
+
+    // Shell extraction can see variable expansions as command-like references.
+    // They are runtime data, not navigable symbols.
+    if language == Language::Shell && is_shell_variable_expansion(target) {
+        return false;
+    }
+
+    // C-family projects often have hundreds of thousands of macro/type-looking
+    // tokens captured as call/reference edges: ERx(...), _T(...), ASSERT(...),
+    // DB_FAILURE_MACRO, DWORD, etc. They are usually preprocessor constants or
+    // external SDK macros, not project symbols an agent can navigate to. Keeping
+    // every occurrence in unresolved_refs makes post-index resolution O(noise).
+    if matches!(language, Language::C | Language::Cpp | Language::Esqlc)
+        && matches!(
+            kind,
+            EdgeKind::Calls | EdgeKind::References | EdgeKind::Instantiates
+        )
+        && is_c_macro_like_external(target)
+    {
+        return false;
+    }
+
+    true
+}
+
+fn is_shell_variable_expansion(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.starts_with('$')
+        || (trimmed.starts_with("${") && trimmed.ends_with('}'))
+        || trimmed.starts_with("$(")
+}
+
+fn is_c_macro_like_external(name: &str) -> bool {
+    let trimmed = name.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    if trimmed.len() <= 1 {
+        return true;
+    }
+    if trimmed.ends_with("_MACRO") {
+        return true;
+    }
+    if trimmed.starts_with('_')
+        && trimmed
+            .chars()
+            .skip(1)
+            .all(|c| c == '_' || c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        return true;
+    }
+    let has_alpha = trimmed.chars().any(|c| c.is_ascii_alphabetic());
+    let has_lower = trimmed.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper = trimmed.chars().any(|c| c.is_ascii_uppercase());
+    has_alpha && has_upper && !has_lower
+}
+
+fn byte_to_line(content: &str, byte_offset: usize) -> u32 {
+    content[..byte_offset.min(content.len())]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count() as u32
+        + 1
+}
+
+fn innermost_node_at_line<'a>(nodes: &'a [Node], line: u32) -> Option<&'a Node> {
+    nodes
+        .iter()
+        .filter(|n| n.start_line <= line && n.end_line.max(n.start_line) >= line)
+        .filter(|n| matches!(n.kind, NodeKind::Function | NodeKind::Method))
+        .min_by_key(|n| n.end_line.saturating_sub(n.start_line))
+        .or_else(|| {
+            nodes
+                .iter()
+                .filter(|n| n.start_line <= line && n.end_line.max(n.start_line) >= line)
+                .min_by_key(|n| n.end_line.saturating_sub(n.start_line))
+        })
 }
 
 struct IndexJob {

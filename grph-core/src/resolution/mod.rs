@@ -7,3 +7,5 @@ pub mod path_aliases;
 mod orchestrator;
 
 pub use orchestrator::ReferenceResolver;
+
+pub use orchestrator::ResolutionResult;

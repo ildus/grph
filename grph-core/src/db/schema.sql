@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS schema_versions (
 -- Insert initial version. Must be idempotent because `grph init` can be
 -- run repeatedly in an existing project.
 INSERT OR IGNORE INTO schema_versions (version, applied_at, description)
-VALUES (1, strftime('%s', 'now') * 1000, 'Initial schema');
+VALUES (4, strftime('%s', 'now') * 1000, 'Initial schema');
 
 -- =============================================================================
 -- Core Tables
@@ -78,6 +78,9 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
     candidates TEXT, -- JSON array
     file_path TEXT NOT NULL DEFAULT '',
     language TEXT NOT NULL DEFAULT 'unknown',
+    resolution_status TEXT,
+    resolution_reason TEXT,
+    resolution_attempted_at INTEGER,
     FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
@@ -103,6 +106,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     signature,
     content='nodes',
     content_rowid='rowid'
+);
+
+
+-- Full-text search index on indexed file source. This is intentionally
+-- contentless from the `files` table because source text is not stored there;
+-- index updates are driven by the extraction orchestrator.
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+    path UNINDEXED,
+    content
 );
 
 -- Triggers to keep FTS index in sync
@@ -137,6 +149,10 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_from_node ON unresolved_refs(from_node
 CREATE INDEX IF NOT EXISTS idx_unresolved_name ON unresolved_refs(reference_name);
 CREATE INDEX IF NOT EXISTS idx_unresolved_file_path ON unresolved_refs(file_path);
 CREATE INDEX IF NOT EXISTS idx_unresolved_from_name ON unresolved_refs(from_node_id, reference_name);
+CREATE INDEX IF NOT EXISTS idx_unresolved_group ON unresolved_refs(reference_name, reference_kind, file_path, language);
+CREATE INDEX IF NOT EXISTS idx_unresolved_pending_group ON unresolved_refs(resolution_status, reference_name, reference_kind, file_path, language);
+CREATE INDEX IF NOT EXISTS idx_unresolved_status_reason ON unresolved_refs(resolution_status, resolution_reason);
+CREATE INDEX IF NOT EXISTS idx_edges_target_kind_source ON edges(target, kind, source);
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
 
 -- Project metadata for version/provenance tracking

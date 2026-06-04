@@ -134,9 +134,40 @@ impl LspHandlers {
         if query.trim().is_empty() {
             return Ok(json!([]));
         }
-        let symbols: Vec<_> = self
-            .grph
-            .search(query, None, 50)?
+
+        // Hybrid workspace search: keep fast symbol-name matches first, then
+        // enrich with symbols from files whose indexed source content matches
+        // the query. This makes editor symbol search useful for product/error
+        // strings and comments, not only identifiers.
+        let mut nodes = Vec::<Node>::new();
+        let mut seen = std::collections::HashSet::<String>::new();
+
+        for node in self.grph.search(query, None, 50)? {
+            if seen.insert(node.id.clone()) {
+                nodes.push(node);
+            }
+        }
+
+        if nodes.len() < 50 {
+            for (file_path, _score) in self.grph.db().search_file_contents(query, 12)? {
+                let mut file_nodes = self.grph.db().list_nodes_by_file(&file_path)?;
+                file_nodes.retain(|node| workspace_symbol_value(node.kind));
+                file_nodes.sort_by_key(|node| (workspace_symbol_rank(node.kind), node.start_line));
+                for node in file_nodes.into_iter().take(6) {
+                    if seen.insert(node.id.clone()) {
+                        nodes.push(node);
+                        if nodes.len() >= 50 {
+                            break;
+                        }
+                    }
+                }
+                if nodes.len() >= 50 {
+                    break;
+                }
+            }
+        }
+
+        let symbols: Vec<_> = nodes
             .iter()
             .filter_map(|node| convert::node_to_symbol_information(&self.root, node))
             .collect();
@@ -355,6 +386,32 @@ impl LspHandlers {
     }
 }
 
+fn workspace_symbol_value(kind: grph_core::NodeKind) -> bool {
+    !matches!(
+        kind,
+        grph_core::NodeKind::Import | grph_core::NodeKind::Export | grph_core::NodeKind::Parameter
+    )
+}
+
+fn workspace_symbol_rank(kind: grph_core::NodeKind) -> u8 {
+    match kind {
+        grph_core::NodeKind::Function | grph_core::NodeKind::Method => 0,
+        grph_core::NodeKind::Class
+        | grph_core::NodeKind::Struct
+        | grph_core::NodeKind::Interface
+        | grph_core::NodeKind::Trait
+        | grph_core::NodeKind::Protocol
+        | grph_core::NodeKind::Component => 1,
+        grph_core::NodeKind::Enum | grph_core::NodeKind::TypeAlias => 2,
+        grph_core::NodeKind::Module | grph_core::NodeKind::Namespace => 3,
+        grph_core::NodeKind::Variable
+        | grph_core::NodeKind::Constant
+        | grph_core::NodeKind::Property
+        | grph_core::NodeKind::Field => 4,
+        _ => 5,
+    }
+}
+
 fn identifier_at(line: &str, character: usize) -> Option<String> {
     let chars: Vec<(usize, char)> = line.char_indices().collect();
     if chars.is_empty() {
@@ -402,4 +459,50 @@ fn identifier_at(line: &str, character: usize) -> Option<String> {
 
 fn is_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grph_core::Grph;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_project(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("grph-lsp-{name}-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn workspace_symbol_uses_file_content_fts() {
+        let dir = temp_project("workspace-fts");
+        fs::write(
+            dir.join("billing.py"),
+            r#"
+def reconcile_account(record):
+    # Handles invoice mismatch recovery for imported ledger rows.
+    if record.get('status') == 'invoice mismatch':
+        return 'needs-review'
+    return 'ok'
+"#,
+        )
+        .unwrap();
+        let mut grph = Grph::init(&dir).unwrap();
+        grph.index(|_| {}).unwrap();
+
+        let handlers = LspHandlers::new(dir.clone()).unwrap();
+        let value = handlers
+            .workspace_symbol(&json!({"query": "invoice mismatch recovery"}))
+            .unwrap();
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(text.contains("reconcile_account"), "{text}");
+
+        fs::remove_dir_all(dir).ok();
+    }
 }

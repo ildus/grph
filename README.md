@@ -23,17 +23,17 @@ Rust, Python, JavaScript/TypeScript, Go, C/C++, Shell, and embedded SQL/C.**
 
 ## Supported Languages
 
-| Language | Extensions | Tree-sitter | Regex Fallback |
-|----------|------------|:-----------:|:--------------:|
-| Rust | `.rs` | ✅ | ✅ |
-| Python | `.py`, `.pyw`, `.pyi` | ✅ | ✅ |
-| JavaScript | `.js`, `.mjs`, `.cjs`, `.jsx` | ✅ | ✅ |
-| TypeScript | `.ts`, `.tsx` | ✅ | ✅ |
-| Go | `.go` | ✅ | ✅ |
-| C | `.c`, `.h` | ✅ | ✅ |
-| C++ | `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.hxx`, `.h++` | ✅ | ✅ |
-| Shell | `.sh`, `.bash` | ✅ | ✅ |
-| ESQL/C and EQUEL/C | `.sc`, `.qsc`, `.qsh` | ✅ | ✅ |
+| Language | Extensions |
+|----------|------------|
+| Rust | `.rs` |
+| Python | `.py`, `.pyw`, `.pyi` |
+| JavaScript | `.js`, `.mjs`, `.cjs`, `.jsx` |
+| TypeScript | `.ts`, `.tsx` |
+| Go | `.go` |
+| C | `.c`, `.h` |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.hxx`, `.h++` |
+| Shell | `.sh`, `.bash` |
+| ESQL/C and EQUEL/C | `.sc`, `.qsc`, `.qsh` |
 
 ## Installation
 
@@ -85,9 +85,9 @@ grph serve --lsp
 | Command | Description |
 |---------|-------------|
 | `grph init` | Initialize `.grph/grph.db` database |
-| `grph init -i` | Initialize + index all files |
-| `grph index [--force] [--quiet] [-j <n>] [path]` | Extract symbols and edges from all source files |
-| `grph sync [--file <path>] [path]` | Incremental sync — re-index changed files only |
+| `grph init -i [--no-resolve]` | Initialize + index all files |
+| `grph index [--force] [--quiet] [--no-resolve] [-j <n>] [path]` | Extract symbols and edges from all source files |
+| `grph sync [--file <path>] [--resolve] [--resolve-limit <n>] [path]` | Incremental sync, or resolve pending references without re-indexing |
 | `grph status` | Show file / node / edge counts |
 | `grph query <name> [--kind <kind>] [--limit <n>] [--json]` | LIKE-based search for symbols |
 | `grph files [--format <fmt>] [--filter <pattern>] [--max-depth <n>] [--json]` | List indexed files |

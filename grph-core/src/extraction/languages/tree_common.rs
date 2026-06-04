@@ -952,7 +952,7 @@ fn cleanup_import_name(import_text: &str, language: Language) -> String {
 
     match language {
         Language::Go => cleanup_go_import_name(cleaned),
-        Language::C | Language::Cpp => cleaned.trim_matches(['<', '>', '"']).trim().to_string(),
+        Language::C | Language::Cpp => cleanup_c_include_name(import_text),
         _ => cleaned
             .split_whitespace()
             .last()
@@ -960,6 +960,18 @@ fn cleanup_import_name(import_text: &str, language: Language) -> String {
             .trim_matches(['"', '\'', ','])
             .to_string(),
     }
+}
+
+fn cleanup_c_include_name(import_text: &str) -> String {
+    let mut text = import_text.trim().trim_end_matches(';').trim();
+    if let Some(rest) = text.strip_prefix('#') {
+        text = rest.trim_start();
+    }
+    if let Some(rest) = text.strip_prefix("include") {
+        text = rest.trim_start();
+    }
+    text.trim_matches(|c| matches!(c, '<' | '>' | '"' | '\'' | ' ' | '\t'))
+        .to_string()
 }
 
 fn cleanup_go_import_name(cleaned: &str) -> String {

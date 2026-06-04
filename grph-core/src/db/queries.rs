@@ -1,6 +1,6 @@
 use crate::db::connection::Database;
 use crate::errors::Result;
-use crate::types::{Edge, EdgeKind, FileRecord, Node, NodeKind, UnresolvedRef};
+use crate::types::{Edge, EdgeKind, FileRecord, Node, NodeKind, UnresolvedRef, UnresolvedRefGroup};
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 
@@ -653,6 +653,7 @@ impl Database {
     }
 
     pub fn delete_file(&self, path: &str) -> Result<()> {
+        self.delete_file_content_fts(path)?;
         self.conn()
             .execute("DELETE FROM files WHERE path = ?1", params![path])?;
         Ok(())
@@ -721,6 +722,77 @@ impl Database {
             .conn()
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
         Ok(count)
+    }
+
+    pub fn upsert_file_content_fts(&self, path: &str, content: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM files_fts WHERE path = ?1", params![path])?;
+        self.conn().execute(
+            "INSERT INTO files_fts(path, content) VALUES (?1, ?2)",
+            params![path, content],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_file_content_fts(&self, path: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM files_fts WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    pub fn search_file_contents(&self, query: &str, limit: u32) -> Result<Vec<(String, f64)>> {
+        let sanitized = fts_query_terms(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn().prepare(
+            "SELECT path, bm25(files_fts) AS rank
+             FROM files_fts
+             WHERE files_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![sanitized, limit], |row| {
+            let path: String = row.get(0)?;
+            let rank: f64 = row.get(1)?;
+            // bm25 is lower-is-better, convert to positive score.
+            Ok((path, -rank))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_all_node_names(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn().prepare("SELECT DISTINCT name FROM nodes")?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(names)
+    }
+
+    pub fn get_nodes_by_name_all(&self, name: &str, limit: u32) -> Result<Vec<Node>> {
+        // This is called once per unresolved reference during post-index
+        // resolution. Keep it strictly index-friendly: an earlier suffix LIKE
+        // (`qualified_name LIKE %.name`) forced a full scan of large `nodes`
+        // tables for every unresolved ref and made big C codebases appear to
+        // hang after parsing. `name` already carries the simple symbol name we
+        // need for call/reference resolution; exact qualified-name lookup is
+        // retained for callers that pass a fully qualified symbol.
+        let mut stmt = self.conn().prepare(
+            "SELECT id, kind, name, qualified_name, file_path, language,
+                    start_line, end_line, start_column, end_column,
+                    docstring, signature, visibility,
+                    is_exported, is_async, is_static, is_abstract,
+                    decorators, type_parameters, updated_at
+             FROM nodes
+             WHERE name = ?1 OR qualified_name = ?1
+             ORDER BY CASE WHEN name = ?1 THEN 0 ELSE 1 END,
+                      length(qualified_name), file_path
+             LIMIT ?2",
+        )?;
+        let nodes = stmt
+            .query_map(params![name, limit], Self::row_to_node)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(nodes)
     }
 
     // ==================== Stats & Metadata ====================
@@ -854,6 +926,125 @@ impl Database {
         Ok(refs)
     }
 
+    pub fn get_unresolved_ref_groups(&self, limit: u32) -> Result<Vec<UnresolvedRefGroup>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT reference_name, reference_kind, file_path, language, COUNT(*) AS c
+             FROM unresolved_refs
+             WHERE resolution_status IS NULL
+             GROUP BY reference_name, reference_kind, file_path, language
+             ORDER BY c DESC
+             LIMIT ?1",
+        )?;
+        let groups = stmt
+            .query_map(params![limit], |row| {
+                Ok(UnresolvedRefGroup {
+                    reference_name: row.get(0)?,
+                    reference_kind: row.get(1)?,
+                    file_path: row.get(2)?,
+                    language: row.get(3)?,
+                    count: row.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(groups)
+    }
+
+    pub fn get_unresolved_ref_groups_for_file(
+        &self,
+        file_path: &str,
+        limit: u32,
+    ) -> Result<Vec<UnresolvedRefGroup>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT reference_name, reference_kind, file_path, language, COUNT(*) AS c
+             FROM unresolved_refs
+             WHERE file_path = ?1 AND resolution_status IS NULL
+             GROUP BY reference_name, reference_kind, file_path, language
+             ORDER BY c DESC
+             LIMIT ?2",
+        )?;
+        let groups = stmt
+            .query_map(params![file_path, limit], |row| {
+                Ok(UnresolvedRefGroup {
+                    reference_name: row.get(0)?,
+                    reference_kind: row.get(1)?,
+                    file_path: row.get(2)?,
+                    language: row.get(3)?,
+                    count: row.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(groups)
+    }
+
+    pub fn update_edges_for_unresolved_group(
+        &self,
+        group: &UnresolvedRefGroup,
+        target_node_id: &str,
+        provenance: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<usize> {
+        let metadata = serde_json::to_string(metadata).unwrap_or_default();
+        let changed = self.conn().execute(
+            "UPDATE edges
+             SET target = ?1, provenance = ?2, metadata = ?3
+             WHERE target = ?4
+               AND kind = ?5
+               AND source IN (SELECT id FROM nodes WHERE file_path = ?6)",
+            params![
+                target_node_id,
+                provenance,
+                metadata,
+                group.reference_name,
+                group.reference_kind,
+                group.file_path,
+            ],
+        )?;
+        Ok(changed)
+    }
+
+    pub fn delete_unresolved_ref_group(&self, group: &UnresolvedRefGroup) -> Result<usize> {
+        let changed = self.conn().execute(
+            "DELETE FROM unresolved_refs
+             WHERE reference_name = ?1
+               AND reference_kind = ?2
+               AND file_path = ?3
+               AND language = ?4",
+            params![
+                group.reference_name,
+                group.reference_kind,
+                group.file_path,
+                group.language,
+            ],
+        )?;
+        Ok(changed)
+    }
+
+    pub fn mark_unresolved_ref_group_attempted(
+        &self,
+        group: &UnresolvedRefGroup,
+        reason: &str,
+    ) -> Result<usize> {
+        let changed = self.conn().execute(
+            "UPDATE unresolved_refs
+             SET resolution_status = 'unresolved',
+                 resolution_reason = ?1,
+                 resolution_attempted_at = CAST(strftime('%s', 'now') AS INTEGER)
+             WHERE reference_name = ?2
+               AND reference_kind = ?3
+               AND file_path = ?4
+               AND language = ?5
+               AND resolution_status IS NULL",
+            params![
+                reason,
+                group.reference_name,
+                group.reference_kind,
+                group.file_path,
+                group.language,
+            ],
+        )?;
+        Ok(changed)
+    }
+
     pub fn get_unresolved_refs_for_file(
         &self,
         file_path: &str,
@@ -929,6 +1120,15 @@ impl Database {
         Ok(count)
     }
 
+    pub fn count_pending_unresolved_refs(&self) -> Result<u64> {
+        let count: u64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM unresolved_refs WHERE resolution_status IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
     pub fn delete_unresolved_ref(&self, id: i64) -> Result<()> {
         self.conn()
             .execute("DELETE FROM unresolved_refs WHERE rowid = ?1", params![id])?;
@@ -948,6 +1148,7 @@ impl Database {
         )?;
         self.conn()
             .execute("DELETE FROM nodes WHERE file_path = ?1", params![file_path])?;
+        self.delete_file_content_fts(file_path)?;
         Ok(())
     }
 
@@ -958,6 +1159,90 @@ impl Database {
             |r| r.get(0),
         )?;
         Ok(count)
+    }
+
+    pub fn set_project_metadata(&self, key: &str, value: &str) -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let updated_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        self.conn().execute(
+            "INSERT INTO project_metadata (key, value, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, value, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_project_metadata(&self, key: &str) -> Result<Option<String>> {
+        self.conn()
+            .query_row(
+                "SELECT value FROM project_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_project_metadata(&self, key: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM project_metadata WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    pub fn clear_graph_for_reindex(&self) -> Result<()> {
+        self.conn().execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DELETE FROM edges;
+             DELETE FROM unresolved_refs;
+             DELETE FROM nodes;
+             DELETE FROM files;
+             DELETE FROM files_fts;
+             DELETE FROM nodes_fts;
+             PRAGMA foreign_keys = ON;",
+        )?;
+        Ok(())
+    }
+
+    pub fn disable_node_fts_triggers(&self) -> Result<()> {
+        self.conn().execute_batch(
+            "DROP TRIGGER IF EXISTS nodes_ai;
+             DROP TRIGGER IF EXISTS nodes_ad;
+             DROP TRIGGER IF EXISTS nodes_au;",
+        )?;
+        Ok(())
+    }
+
+    pub fn recreate_node_fts_triggers(&self) -> Result<()> {
+        self.conn().execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
+                 INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature)
+                 VALUES (NEW.rowid, NEW.id, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
+             END;
+             CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
+                 INSERT INTO nodes_fts(nodes_fts, rowid, id, name, qualified_name, docstring, signature)
+                 VALUES ('delete', OLD.rowid, OLD.id, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature);
+             END;
+             CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
+                 INSERT INTO nodes_fts(nodes_fts, rowid, id, name, qualified_name, docstring, signature)
+                 VALUES ('delete', OLD.rowid, OLD.id, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature);
+                 INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature)
+                 VALUES (NEW.rowid, NEW.id, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
+             END;",
+        )?;
+        Ok(())
+    }
+
+    pub fn rebuild_nodes_fts(&self) -> Result<()> {
+        self.conn().execute_batch(
+            "DELETE FROM nodes_fts;
+             INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature)
+             SELECT rowid, id, name, qualified_name, docstring, signature FROM nodes;",
+        )?;
+        Ok(())
     }
 
     // ==================== Helpers ====================
@@ -1053,6 +1338,17 @@ fn wildcard_query_to_like(query: &str) -> String {
 
 fn wildcard_query_rank_term(query: &str) -> String {
     query.trim_end_matches(['*', '?', '%', '_']).to_string()
+}
+
+fn fts_query_terms(query: &str) -> String {
+    let terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .map(str::trim)
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.replace('"', ""))
+        .filter(|t| !t.is_empty())
+        .collect();
+    terms.join(" OR ")
 }
 
 fn dedupe_edge_results(results: &mut Vec<(Node, Edge)>) {

@@ -236,10 +236,15 @@ pub struct FileRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexProgress {
+    /// Backward-compatible single progress counter for the active phase.
     pub current: u64,
     pub total: u64,
     pub phase: String,
     pub current_file: Option<String>,
+    /// Number of files whose parse job has completed, including skipped/failed parse jobs.
+    pub parsed: u64,
+    /// Number of parsed files committed to the SQLite store.
+    pub stored: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +274,15 @@ pub struct UnresolvedRef {
     pub candidates: Option<Vec<String>>,
     pub file_path: String,
     pub language: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnresolvedRefGroup {
+    pub reference_name: String,
+    pub reference_kind: String,
+    pub file_path: String,
+    pub language: String,
+    pub count: u64,
 }
 
 pub struct GraphStats {

@@ -1,3 +1,4 @@
+use crate::db::migrations::run_migrations;
 use crate::db::schema::SCHEMA_SQL;
 use crate::errors::Result;
 use rusqlite::Connection;
@@ -29,7 +30,21 @@ impl Database {
 
         let conn = Connection::open(&db_path)?;
         configure_connection(&conn)?;
-        Ok(Self { conn, db_path })
+        let db = Self { conn, db_path };
+        // Existing projects may predate newer schema objects. Run idempotent
+        // migrations on open so MCP/CLI tools can use new indexes immediately.
+        if db
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_versions'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .is_ok()
+        {
+            run_migrations(&db)?;
+        }
+        Ok(db)
     }
 
     /// Open from an explicit path
@@ -45,6 +60,7 @@ impl Database {
     /// Initialize schema if first run
     pub fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA_SQL)?;
+        run_migrations(self)?;
         Ok(())
     }
 

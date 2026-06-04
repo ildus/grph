@@ -339,3 +339,87 @@ fn cli_mcp_stdio_content_length_end_to_end() {
     let _ = child.wait();
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn cli_context_surfaces_relevant_tail_callee_from_large_function() {
+    let dir = temp_project("context-tail-callee");
+    let mut source = String::new();
+    source.push_str(
+        "fn bootstrap() {
+",
+    );
+    source.push_str(
+        "    // Widget relocation failure happens in this orchestration path.
+",
+    );
+    for i in 0..30 {
+        source.push_str(&format!(
+            "    utility_{i}();
+"
+        ));
+    }
+    source.push_str(
+        "    specialized_tail_helper();
+",
+    );
+    source.push_str(
+        "}
+
+",
+    );
+    for i in 0..30 {
+        source.push_str(&format!(
+            "fn utility_{i}() {{}}
+"
+        ));
+    }
+    source.push_str(
+        "fn specialized_tail_helper() {}
+",
+    );
+    fs::write(dir.join("main.rs"), source).unwrap();
+
+    let grph = env!("CARGO_BIN_EXE_grph");
+    let init = Command::new(grph)
+        .args(["init", "-i"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let context = Command::new(grph)
+        .args([
+            "context",
+            "--max-nodes",
+            "8",
+            "widget relocation failure orchestration path",
+        ])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        context.status.success(),
+        "context failed: {}",
+        String::from_utf8_lossy(&context.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&context.stdout);
+    assert!(stdout.contains("bootstrap"), "{stdout}");
+    assert!(
+        stdout.contains("specialized_tail_helper"),
+        "tail callee should survive context budget despite many earlier utility calls: {stdout}"
+    );
+    assert!(
+        stdout.contains("callee of bootstrap"),
+        "related-symbol output should explain why the helper is relevant: {stdout}"
+    );
+    assert!(
+        stdout.contains("specialized_tail_helper();"),
+        "code snippets should center on selected call sites when the full function is too large: {stdout}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
