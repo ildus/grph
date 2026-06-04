@@ -309,7 +309,15 @@ impl LspHandlers {
         if let Some(node) = self.grph.db().get_node_by_name(&symbol, &file_path)? {
             return Ok(Some(node));
         }
-        self.grph.db().get_node_by_name_any(&symbol)
+
+        // Match CLI symbol resolution for references/call hierarchy. A bare
+        // name can have many nodes in portable C codebases (platform-specific
+        // implementations, header macros/prototypes, etc.). The raw
+        // get_node_by_name_any() ordering is intentionally minimal and can pick
+        // a declaration-like/header node with no callers. grph search applies
+        // the user-facing symbol ranking used by grph callers, so LSP actions
+        // on call-sites resolve to the same implementation the CLI reports.
+        Ok(self.grph.search(&symbol, None, 1)?.into_iter().next())
     }
 
     fn symbol_at_params(&self, params: &Value, file_path: &str) -> Option<String> {

@@ -1201,7 +1201,7 @@ impl Database {
              DELETE FROM nodes;
              DELETE FROM files;
              DELETE FROM files_fts;
-             DELETE FROM nodes_fts;
+             INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');
              PRAGMA foreign_keys = ON;",
         )?;
         Ok(())
@@ -1237,11 +1237,13 @@ impl Database {
     }
 
     pub fn rebuild_nodes_fts(&self) -> Result<()> {
-        self.conn().execute_batch(
-            "DELETE FROM nodes_fts;
-             INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature)
-             SELECT rowid, id, name, qualified_name, docstring, signature FROM nodes;",
-        )?;
+        // nodes_fts is an external-content FTS5 table using the nodes table
+        // as its content source. Use FTS5's rebuild command instead of
+        // manually deleting/inserting rows; manual mutation can fail on large
+        // indexes with SQLite/FTS5 malformed-image errors even when the base
+        // tables pass integrity checks.
+        self.conn()
+            .execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')", [])?;
         Ok(())
     }
 
