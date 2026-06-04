@@ -48,12 +48,48 @@ impl LspHandlers {
     }
 
     pub fn definition(&self, params: &Value) -> grph_core::Result<Value> {
-        let node = self.resolve_node_at_params(params)?;
-        Ok(node
+        if let Some(location) = self.definition_location_at_params(params)? {
+            return Ok(serde_json::to_value(location).unwrap_or(Value::Null));
+        }
+        Ok(Value::Null)
+    }
+
+    fn definition_location_at_params(
+        &self,
+        params: &Value,
+    ) -> grph_core::Result<Option<lsp_types::Location>> {
+        let Some(file_path) = self.text_document_file_path(params) else {
+            return Ok(None);
+        };
+        let Some(symbol) = self.symbol_at_params(params, &file_path) else {
+            return Ok(None);
+        };
+
+        if let Some(node) = self.grph.db().get_node_by_name(&symbol, &file_path)? {
+            return Ok(convert::node_location(&self.root, &node));
+        }
+
+        // Prefer a local textual declaration before global lookup. This keeps
+        // go-to-definition on local C variables such as context from doing a
+        // broad workspace search for a very common name, and returns the actual
+        // local declaration when the extractor did not index block locals.
+        if let Some(location) = self.local_symbol_definition(params, &file_path, &symbol) {
+            return Ok(Some(location));
+        }
+
+        // Global lookup is appropriate for call-sites and symbol-like names,
+        // but not for plain lowercase local variables. The latter otherwise
+        // resolve to arbitrary workspace symbols with the same common name.
+        if self.should_global_lookup(params, &file_path, &symbol) {
+            if let Some(node) = self.grph.search(&symbol, None, 1)?.into_iter().next() {
+                return Ok(convert::node_location(&self.root, &node));
+            }
+        }
+
+        Ok(self
+            .node_at_params(params)?
             .as_ref()
-            .and_then(|node| convert::node_location(&self.root, node))
-            .and_then(|loc| serde_json::to_value(loc).ok())
-            .unwrap_or(Value::Null))
+            .and_then(|node| convert::node_location(&self.root, node)))
     }
 
     pub fn references(&self, params: &Value) -> grph_core::Result<Value> {
@@ -344,6 +380,73 @@ impl LspHandlers {
         std::fs::read_to_string(path).ok()
     }
 
+    fn local_symbol_definition(
+        &self,
+        params: &Value,
+        file_path: &str,
+        symbol: &str,
+    ) -> Option<lsp_types::Location> {
+        let cursor_line = params.pointer("/position/line").and_then(Value::as_u64)? as usize;
+        let content = self.document_content(params, file_path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        for line_index in (0..cursor_line.min(lines.len())).rev() {
+            let line = lines[line_index];
+            let Some((start, end)) = find_identifier_span_in_line(line, symbol) else {
+                continue;
+            };
+            if !looks_like_local_declaration(line, start, end) {
+                continue;
+            }
+            return Some(lsp_types::Location {
+                uri: lsp_types::Uri::from_str(&convert::path_to_uri(&self.root, file_path)).ok()?,
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: line_index as u32,
+                        character: start as u32,
+                    },
+                    end: lsp_types::Position {
+                        line: line_index as u32,
+                        character: end as u32,
+                    },
+                },
+            });
+        }
+        None
+    }
+
+    fn should_global_lookup(&self, params: &Value, file_path: &str, symbol: &str) -> bool {
+        if symbol.contains('_')
+            || symbol.contains('$')
+            || symbol.chars().any(|c| c.is_ascii_uppercase())
+        {
+            return true;
+        }
+        self.symbol_looks_like_call(params, file_path, symbol)
+    }
+
+    fn symbol_looks_like_call(&self, params: &Value, file_path: &str, symbol: &str) -> bool {
+        let Some(line_index) = params.pointer("/position/line").and_then(Value::as_u64) else {
+            return false;
+        };
+        let Some(character) = params
+            .pointer("/position/character")
+            .and_then(Value::as_u64)
+        else {
+            return false;
+        };
+        let Some(content) = self.document_content(params, file_path) else {
+            return false;
+        };
+        let Some(line) = content.lines().nth(line_index as usize) else {
+            return false;
+        };
+        let Some((_, end)) = identifier_span_at(line, character as usize) else {
+            return false;
+        };
+        line[end..].trim_start().starts_with('(')
+            && identifier_at(line, character as usize).as_deref() == Some(symbol)
+    }
+
     fn node_from_call_item(&self, params: &Value) -> grph_core::Result<Option<Node>> {
         let Some(data) = params.pointer("/item/data") else {
             return Ok(None);
@@ -467,6 +570,88 @@ fn identifier_at(line: &str, character: usize) -> Option<String> {
 
 fn is_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+}
+
+fn find_identifier_span_in_line(line: &str, symbol: &str) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    while let Some(pos) = line[offset..].find(symbol) {
+        let start = offset + pos;
+        let end = start + symbol.len();
+        let before = line[..start].chars().next_back();
+        let after = line[end..].chars().next();
+        if before.map(|c| !is_ident_char(c)).unwrap_or(true)
+            && after.map(|c| !is_ident_char(c)).unwrap_or(true)
+        {
+            return Some((start, end));
+        }
+        offset = end;
+    }
+    None
+}
+
+fn looks_like_local_declaration(line: &str, start: usize, end: usize) -> bool {
+    let code = line
+        .split("/*")
+        .next()
+        .unwrap_or(line)
+        .split("//")
+        .next()
+        .unwrap_or(line);
+    if start >= code.len() || end > code.len() {
+        return false;
+    }
+    let before = code[..start].trim_end();
+    let after = code[end..].trim_start();
+    if before.is_empty() || before.ends_with('.') || before.ends_with("->") {
+        return false;
+    }
+    if !matches!(after.chars().next(), Some(';' | ',' | '=' | '[')) {
+        return false;
+    }
+    let tail = before.rsplit([';', '{', '}']).next().unwrap_or(before);
+    !tail.contains('(')
+}
+
+fn identifier_span_at(line: &str, character: usize) -> Option<(usize, usize)> {
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let mut byte_index = line.len();
+    for (char_index, (byte, _)) in chars.iter().enumerate() {
+        if char_index >= character {
+            byte_index = *byte;
+            break;
+        }
+    }
+    if byte_index == line.len() && character < chars.len() {
+        byte_index = chars[character].0;
+    }
+    let mut start = byte_index;
+    while start > 0 {
+        let Some((prev, ch)) = line[..start].char_indices().next_back() else {
+            break;
+        };
+        if !is_ident_char(ch) {
+            break;
+        }
+        start = prev;
+    }
+    let mut end = byte_index;
+    while end < line.len() {
+        let Some(ch) = line[end..].chars().next() else {
+            break;
+        };
+        if !is_ident_char(ch) {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    if start == end {
+        None
+    } else {
+        Some((start, end))
+    }
 }
 
 #[cfg(test)]
