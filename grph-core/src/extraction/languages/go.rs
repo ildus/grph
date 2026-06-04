@@ -10,7 +10,7 @@ pub fn extract(source: &str, file_path: &str) -> Result<ExtractionResult> {
         file_path,
         TreeConfig {
             language: Language::Go,
-            grammar: tree_sitter_go::language(),
+            grammar: tree_sitter_go::LANGUAGE.into(),
             parser_name: "Go",
             container_kinds: &[KindMap {
                 ts_kind: "type_spec",

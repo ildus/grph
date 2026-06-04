@@ -88,7 +88,12 @@ impl ReferenceResolver {
                 continue;
             }
 
-            match self.resolve_reference_candidate(name, &group.file_path, language)? {
+            match self.resolve_reference_candidate(
+                name,
+                &group.file_path,
+                language,
+                &group.reference_kind,
+            )? {
                 Some(node) => {
                     let metadata = serde_json::json!({
                         "resolvedBy": "cross-file-grouped",
@@ -194,6 +199,7 @@ impl ReferenceResolver {
         name: &str,
         file_path: &str,
         language: Language,
+        reference_kind: &str,
     ) -> Result<Option<Node>> {
         // Fast negative pre-filter. Large C/Esqlc projects produce many
         // references to external APIs, macros, or generated symbols that never
@@ -222,12 +228,25 @@ impl ReferenceResolver {
             return Ok(candidates.into_iter().next());
         }
 
+        // For C-family call edges, compile_commands.json describes the active
+        // build/platform better than the textual include graph. Try it before
+        // imported headers so a platform header macro/prototype does not steal
+        // callers from the compiled implementation.
+        let c_call_ref = is_c_family(language) && is_call_reference_kind(reference_kind);
+        if c_call_ref {
+            if let Some(node) = self.best_compile_db_candidate(&candidates, file_path)? {
+                return Ok(Some(node));
+            }
+        }
+
         let imported_files = self.imported_files_for(file_path, language)?;
-        if let Some(node) = best_imported_candidate(&candidates, &imported_files, language) {
+        if let Some(node) =
+            best_imported_candidate(&candidates, &imported_files, language, reference_kind)
+        {
             return Ok(Some(node));
         }
 
-        if matches!(language, Language::C | Language::Cpp | Language::Esqlc) {
+        if is_c_family(language) && !c_call_ref {
             if let Some(node) = self.best_compile_db_candidate(&candidates, file_path)? {
                 return Ok(Some(node));
             }
@@ -237,8 +256,8 @@ impl ReferenceResolver {
         // per platform (e.g. zq_unix_win/zq.c and zq_vms/zq.c). If no included
         // declaration disambiguates the symbol, prefer the platform branch that
         // matches this checkout instead of leaving every call unresolved.
-        if matches!(language, Language::C | Language::Cpp | Language::Esqlc) {
-            if let Some(node) = best_c_platform_candidate(&candidates) {
+        if is_c_family(language) {
+            if let Some(node) = best_c_platform_candidate(&candidates, reference_kind) {
                 return Ok(Some(node));
             }
         }
@@ -533,6 +552,7 @@ fn best_imported_candidate(
     candidates: &[Node],
     imported_files: &HashSet<String>,
     language: Language,
+    reference_kind: &str,
 ) -> Option<Node> {
     let mut matches: Vec<&Node> = candidates
         .iter()
@@ -541,16 +561,28 @@ fn best_imported_candidate(
     if matches.is_empty() {
         return None;
     }
-    matches.sort_by_key(|node| {
-        (
-            c_header_preference(&node.file_path),
-            std::cmp::Reverse(resolution_kind_score(node.kind)),
-            node.file_path.clone(),
-            node.start_line,
-        )
-    });
 
-    if matches!(language, Language::C | Language::Cpp | Language::Esqlc) {
+    // For C call expressions, an included header declaration/macro is useful
+    // evidence but is not necessarily the call target. If an implementation
+    // definition with the same name exists elsewhere, let compile-db/platform
+    // resolution choose it instead of eagerly returning the header node.
+    if is_c_family(language) && is_call_reference_kind(reference_kind) {
+        let implementation_exists = candidates.iter().any(is_c_implementation_definition);
+        let implementation_matches: Vec<&Node> = matches
+            .iter()
+            .copied()
+            .filter(|node| is_c_implementation_definition(node))
+            .collect();
+        if !implementation_matches.is_empty() {
+            matches = implementation_matches;
+        } else if implementation_exists {
+            return None;
+        }
+    }
+
+    matches.sort_by_key(|node| c_candidate_sort_key(node, reference_kind));
+
+    if is_c_family(language) {
         return matches.first().cloned().cloned();
     }
 
@@ -561,7 +593,7 @@ fn best_imported_candidate(
     }
 }
 
-fn best_c_platform_candidate(candidates: &[Node]) -> Option<Node> {
+fn best_c_platform_candidate(candidates: &[Node], reference_kind: &str) -> Option<Node> {
     let mut ranked: Vec<&Node> = candidates
         .iter()
         .filter(|node| resolution_kind_score(node.kind) >= 5)
@@ -569,24 +601,11 @@ fn best_c_platform_candidate(candidates: &[Node]) -> Option<Node> {
     if ranked.len() < 2 {
         return ranked.first().cloned().cloned();
     }
-    ranked.sort_by_key(|node| {
-        (
-            c_header_preference(&node.file_path),
-            std::cmp::Reverse(resolution_kind_score(node.kind)),
-            node.file_path.clone(),
-            node.start_line,
-        )
-    });
+    ranked.sort_by_key(|node| c_candidate_sort_key(node, reference_kind));
     let best = ranked[0];
     let second = ranked[1];
-    let best_key = (
-        c_header_preference(&best.file_path),
-        resolution_kind_score(best.kind),
-    );
-    let second_key = (
-        c_header_preference(&second.file_path),
-        resolution_kind_score(second.kind),
-    );
+    let best_key = c_candidate_disambiguation_key(best, reference_kind);
+    let second_key = c_candidate_disambiguation_key(second, reference_kind);
     if best_key != second_key {
         Some(best.clone())
     } else {
@@ -594,18 +613,71 @@ fn best_c_platform_candidate(candidates: &[Node]) -> Option<Node> {
     }
 }
 
+fn c_candidate_sort_key(
+    node: &Node,
+    reference_kind: &str,
+) -> (u8, u8, std::cmp::Reverse<u8>, String, u32) {
+    (
+        c_implementation_preference(node, reference_kind),
+        c_header_preference(&node.file_path),
+        std::cmp::Reverse(resolution_kind_score(node.kind)),
+        node.file_path.clone(),
+        node.start_line,
+    )
+}
+
+fn c_candidate_disambiguation_key(node: &Node, reference_kind: &str) -> (u8, u8, u8) {
+    (
+        c_implementation_preference(node, reference_kind),
+        c_header_preference(&node.file_path),
+        resolution_kind_score(node.kind),
+    )
+}
+
+fn c_implementation_preference(node: &Node, reference_kind: &str) -> u8 {
+    if is_call_reference_kind(reference_kind) && is_c_implementation_definition(node) {
+        0
+    } else {
+        1
+    }
+}
+
+fn is_call_reference_kind(reference_kind: &str) -> bool {
+    matches!(reference_kind, "calls" | "instantiates")
+}
+
+fn is_c_family(language: Language) -> bool {
+    matches!(language, Language::C | Language::Cpp | Language::Esqlc)
+}
+
+fn is_c_implementation_definition(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Function | NodeKind::Method)
+        && !is_c_header_like_path(&node.file_path)
+}
+
+fn is_c_header_like_path(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_ascii_lowercase();
+    p.ends_with(".h")
+        || p.ends_with(".hh")
+        || p.ends_with(".hpp")
+        || p.ends_with(".hxx")
+        || p.contains("/hdr/")
+        || p.contains("/hdr_")
+        || p.contains("_hdr/")
+}
+
 fn c_header_preference(path: &str) -> u8 {
     let p = path.replace('\\', "/").to_ascii_lowercase();
     if p.contains("/hdr_unix_win/") || p.contains("_unix_win/") || p.contains("/unix_win/") {
         0
-    } else if p.contains("/hdr/") {
-        1
     } else if p.contains("/hdr_unix/") || p.contains("_unix/") || p.contains("/unix/") {
         2
     } else if p.contains("/hdr_win/") || p.contains("_win/") || p.contains("/win/") {
         3
     } else if p.contains("/hdr_vms/") || p.contains("_vms/") || p.contains("/vms/") {
         8
+    } else if p.contains("/hdr/") {
+        1
     } else if p.contains("/erold") || p.contains("/old") {
         9
     } else {

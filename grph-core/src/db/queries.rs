@@ -327,19 +327,19 @@ impl Database {
     }
 
     pub fn count_nodes(&self) -> Result<u64> {
-        let count: u64 = self
+        let count: i64 = self
             .conn()
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
-        Ok(count)
+        Ok(count as u64)
     }
 
     pub fn count_nodes_by_kind(&self, kind: NodeKind) -> Result<u64> {
-        let count: u64 = self.conn().query_row(
+        let count: i64 = self.conn().query_row(
             "SELECT COUNT(*) FROM nodes WHERE kind = ?1",
             [kind.as_str()],
             |r| r.get(0),
         )?;
-        Ok(count)
+        Ok(count as u64)
     }
 
     // ==================== Edge operations ====================
@@ -617,19 +617,19 @@ impl Database {
     }
 
     pub fn count_edges(&self) -> Result<u64> {
-        let count: u64 = self
+        let count: i64 = self
             .conn()
             .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
-        Ok(count)
+        Ok(count as u64)
     }
 
     pub fn count_edges_by_kind(&self, kind: EdgeKind) -> Result<u64> {
-        let count: u64 = self.conn().query_row(
+        let count: i64 = self.conn().query_row(
             "SELECT COUNT(*) FROM edges WHERE kind = ?1",
             [kind.as_str()],
             |r| r.get(0),
         )?;
-        Ok(count)
+        Ok(count as u64)
     }
 
     // ==================== File operations ====================
@@ -642,7 +642,7 @@ impl Database {
                 &file.path,
                 &file.content_hash,
                 file.language.as_str(),
-                file.size,
+                file.size as i64,
                 file.modified_at,
                 file.indexed_at,
                 file.node_count,
@@ -698,8 +698,8 @@ impl Database {
         let result: Vec<(String, u64)> = stmt
             .query_map([], |row| {
                 let lang: String = row.get(0)?;
-                let count: u64 = row.get(1)?;
-                Ok((lang, count))
+                let count: i64 = row.get(1)?;
+                Ok((lang, count as u64))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(result)
@@ -718,10 +718,10 @@ impl Database {
     }
 
     pub fn count_files(&self) -> Result<u64> {
-        let count: u64 = self
+        let count: i64 = self
             .conn()
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
-        Ok(count)
+        Ok(count as u64)
     }
 
     pub fn upsert_file_content_fts(&self, path: &str, content: &str) -> Result<()> {
@@ -805,8 +805,8 @@ impl Database {
             let rows: Vec<(String, u64)> = stmt
                 .query_map([], |row| {
                     let k: String = row.get(0)?;
-                    let c: u64 = row.get(1)?;
-                    Ok((k, c))
+                    let c: i64 = row.get(1)?;
+                    Ok((k, c as u64))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let map: serde_json::Map<String, serde_json::Value> = rows
@@ -823,8 +823,8 @@ impl Database {
             let rows: Vec<(String, u64)> = stmt
                 .query_map([], |row| {
                     let k: String = row.get(0)?;
-                    let c: u64 = row.get(1)?;
-                    Ok((k, c))
+                    let c: i64 = row.get(1)?;
+                    Ok((k, c as u64))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let map: serde_json::Map<String, serde_json::Value> = rows
@@ -841,8 +841,8 @@ impl Database {
             let rows: Vec<(String, u64)> = stmt
                 .query_map([], |row| {
                     let k: String = row.get(0)?;
-                    let c: u64 = row.get(1)?;
-                    Ok((k, c))
+                    let c: i64 = row.get(1)?;
+                    Ok((k, c as u64))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let map: serde_json::Map<String, serde_json::Value> = rows
@@ -1114,19 +1114,19 @@ impl Database {
     }
 
     pub fn count_unresolved_refs(&self) -> Result<u64> {
-        let count: u64 =
+        let count: i64 =
             self.conn()
                 .query_row("SELECT COUNT(*) FROM unresolved_refs", [], |r| r.get(0))?;
-        Ok(count)
+        Ok(count as u64)
     }
 
     pub fn count_pending_unresolved_refs(&self) -> Result<u64> {
-        let count: u64 = self.conn().query_row(
+        let count: i64 = self.conn().query_row(
             "SELECT COUNT(*) FROM unresolved_refs WHERE resolution_status IS NULL",
             [],
             |r| r.get(0),
         )?;
-        Ok(count)
+        Ok(count as u64)
     }
 
     pub fn delete_unresolved_ref(&self, id: i64) -> Result<()> {
@@ -1299,7 +1299,7 @@ impl Database {
             path: row.get(0)?,
             content_hash: row.get(1)?,
             language: Language::from_str(&language_str).unwrap_or(Language::Python),
-            size: row.get(3)?,
+            size: row.get::<_, i64>(3)? as u64,
             modified_at: row.get(4)?,
             indexed_at: row.get(5)?,
             node_count: row.get(6)?,

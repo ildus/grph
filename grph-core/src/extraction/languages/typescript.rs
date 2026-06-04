@@ -10,7 +10,7 @@ pub fn extract(source: &str, file_path: &str) -> Result<ExtractionResult> {
         file_path,
         TreeConfig {
             language: Language::TypeScript,
-            grammar: tree_sitter_typescript::language_typescript(),
+            grammar: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             parser_name: "TypeScript",
             container_kinds: &[
                 KindMap {

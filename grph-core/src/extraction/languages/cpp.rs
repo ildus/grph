@@ -10,7 +10,7 @@ pub fn extract(source: &str, file_path: &str) -> Result<ExtractionResult> {
         file_path,
         TreeConfig {
             language: Language::Cpp,
-            grammar: tree_sitter_cpp::language(),
+            grammar: tree_sitter_cpp::LANGUAGE.into(),
             parser_name: "C++",
             container_kinds: &[
                 KindMap {

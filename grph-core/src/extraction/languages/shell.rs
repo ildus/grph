@@ -7,8 +7,9 @@ use tree_sitter::{Node as TsNode, Parser};
 
 pub fn extract(source: &str, file_path: &str) -> Result<ExtractionResult> {
     let mut parser = Parser::new();
+    let language = tree_sitter_bash::LANGUAGE.into();
     parser
-        .set_language(&tree_sitter_bash::language())
+        .set_language(&language)
         .map_err(|e| GrphError::Parse(format!("failed to load Bash grammar: {e}")))?;
     let tree = parser
         .parse(source, None)

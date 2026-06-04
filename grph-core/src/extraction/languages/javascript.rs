@@ -10,7 +10,7 @@ pub fn extract(source: &str, file_path: &str) -> Result<ExtractionResult> {
         file_path,
         TreeConfig {
             language: Language::JavaScript,
-            grammar: tree_sitter_javascript::language(),
+            grammar: tree_sitter_javascript::LANGUAGE.into(),
             parser_name: "JavaScript",
             container_kinds: &[KindMap {
                 ts_kind: "class_declaration",
