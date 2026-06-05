@@ -2,14 +2,18 @@ use crate::convert;
 use grph_core::{Edge, Grph, Node};
 use lsp_types::{CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
+use tree_sitter::{Language as TsLanguage, Node as TsNode, Parser, Point};
 
 pub struct LspHandlers {
     root: PathBuf,
     grph: Grph,
     buffers: HashMap<String, String>,
+    parse_cache: RefCell<HashMap<String, ParsedCacheEntry>>,
 }
 
 const DEFAULT_CALLERS_LIMIT: u32 = 1000;
@@ -20,6 +24,7 @@ impl LspHandlers {
             grph: Grph::open(&root)?,
             root,
             buffers: HashMap::new(),
+            parse_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -65,16 +70,18 @@ impl LspHandlers {
             return Ok(None);
         };
 
-        if let Some(node) = self.grph.db().get_node_by_name(&symbol, &file_path)? {
-            return Ok(convert::node_location(&self.root, &node));
+        // Prefer a tree-sitter local declaration for non-call identifiers. This keeps
+        // go-to-definition on local C variables such as context from resolving to
+        // a same-file/global function with a common name, while still letting
+        // call-sites resolve through the indexed graph below.
+        if !self.symbol_looks_like_call(params, &file_path, &symbol) {
+            if let Some(location) = self.local_symbol_definition(params, &file_path, &symbol) {
+                return Ok(Some(location));
+            }
         }
 
-        // Prefer a local textual declaration before global lookup. This keeps
-        // go-to-definition on local C variables such as context from doing a
-        // broad workspace search for a very common name, and returns the actual
-        // local declaration when the extractor did not index block locals.
-        if let Some(location) = self.local_symbol_definition(params, &file_path, &symbol) {
-            return Ok(Some(location));
+        if let Some(node) = self.grph.db().get_node_by_name(&symbol, &file_path)? {
+            return Ok(convert::node_location(&self.root, &node));
         }
 
         // Global lookup is appropriate for call-sites and symbol-like names,
@@ -283,6 +290,9 @@ impl LspHandlers {
     pub fn did_close(&mut self, params: &Value) {
         if let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) {
             self.buffers.remove(uri);
+            if let Some(file_path) = convert::uri_to_file_path(&self.root, uri) {
+                self.parse_cache.borrow_mut().remove(&file_path);
+            }
         }
     }
 
@@ -357,6 +367,10 @@ impl LspHandlers {
     }
 
     fn symbol_at_params(&self, params: &Value, file_path: &str) -> Option<String> {
+        if let Some(symbol) = self.tree_sitter_identifier_at_params(params, file_path) {
+            return Some(symbol);
+        }
+
         let line = params.pointer("/position/line").and_then(Value::as_u64)? as usize;
         let character = params
             .pointer("/position/character")
@@ -364,6 +378,13 @@ impl LspHandlers {
         let content = self.document_content(params, file_path)?;
         let source_line = content.lines().nth(line)?;
         identifier_at(source_line, character)
+    }
+
+    fn tree_sitter_identifier_at_params(&self, params: &Value, file_path: &str) -> Option<String> {
+        let position = position_from_params(params)?;
+        let (content, parsed) = self.parsed_document(params, file_path)?;
+        let ident = parsed.identifier_at_point(position)?;
+        Some(text(ident, &content).to_string())
     }
 
     fn document_content(&self, params: &Value, file_path: &str) -> Option<String> {
@@ -380,38 +401,45 @@ impl LspHandlers {
         std::fs::read_to_string(path).ok()
     }
 
+    fn parsed_document(&self, params: &Value, file_path: &str) -> Option<(String, ParsedDocument)> {
+        let content = self.document_content(params, file_path)?;
+        let content_hash = stable_hash(&content);
+        let cache_key = file_path.to_string();
+        if let Some(entry) = self.parse_cache.borrow().get(&cache_key) {
+            if entry.content_hash == content_hash {
+                return Some((
+                    content,
+                    ParsedDocument {
+                        tree: entry.tree.clone(),
+                    },
+                ));
+            }
+        }
+
+        let parsed = ParsedDocument::parse(file_path, &content)?;
+        self.parse_cache.borrow_mut().insert(
+            cache_key,
+            ParsedCacheEntry {
+                content_hash,
+                tree: parsed.tree.clone(),
+            },
+        );
+        Some((content, parsed))
+    }
+
     fn local_symbol_definition(
         &self,
         params: &Value,
         file_path: &str,
         symbol: &str,
     ) -> Option<lsp_types::Location> {
-        let cursor_line = params.pointer("/position/line").and_then(Value::as_u64)? as usize;
-        let content = self.document_content(params, file_path)?;
-        let lines: Vec<&str> = content.lines().collect();
-        for line_index in (0..cursor_line.min(lines.len())).rev() {
-            let line = lines[line_index];
-            let Some((start, end)) = find_identifier_span_in_line(line, symbol) else {
-                continue;
-            };
-            if !looks_like_local_declaration(line, start, end) {
-                continue;
-            }
-            return Some(lsp_types::Location {
-                uri: lsp_types::Uri::from_str(&convert::path_to_uri(&self.root, file_path)).ok()?,
-                range: lsp_types::Range {
-                    start: lsp_types::Position {
-                        line: line_index as u32,
-                        character: start as u32,
-                    },
-                    end: lsp_types::Position {
-                        line: line_index as u32,
-                        character: end as u32,
-                    },
-                },
-            });
-        }
-        None
+        let position = position_from_params(params)?;
+        let (content, parsed) = self.parsed_document(params, file_path)?;
+        let declaration = parsed.local_declaration_before(position, symbol, &content)?;
+        Some(lsp_types::Location {
+            uri: lsp_types::Uri::from_str(&convert::path_to_uri(&self.root, file_path)).ok()?,
+            range: range_for_node(declaration),
+        })
     }
 
     fn should_global_lookup(&self, params: &Value, file_path: &str, symbol: &str) -> bool {
@@ -425,26 +453,13 @@ impl LspHandlers {
     }
 
     fn symbol_looks_like_call(&self, params: &Value, file_path: &str, symbol: &str) -> bool {
-        let Some(line_index) = params.pointer("/position/line").and_then(Value::as_u64) else {
+        let Some(position) = position_from_params(params) else {
             return false;
         };
-        let Some(character) = params
-            .pointer("/position/character")
-            .and_then(Value::as_u64)
-        else {
+        let Some((content, parsed)) = self.parsed_document(params, file_path) else {
             return false;
         };
-        let Some(content) = self.document_content(params, file_path) else {
-            return false;
-        };
-        let Some(line) = content.lines().nth(line_index as usize) else {
-            return false;
-        };
-        let Some((_, end)) = identifier_span_at(line, character as usize) else {
-            return false;
-        };
-        line[end..].trim_start().starts_with('(')
-            && identifier_at(line, character as usize).as_deref() == Some(symbol)
+        parsed.identifier_is_call(position, symbol, &content)
     }
 
     fn node_from_call_item(&self, params: &Value) -> grph_core::Result<Option<Node>> {
@@ -572,86 +587,319 @@ fn is_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
 }
 
-fn find_identifier_span_in_line(line: &str, symbol: &str) -> Option<(usize, usize)> {
-    let mut offset = 0;
-    while let Some(pos) = line[offset..].find(symbol) {
-        let start = offset + pos;
-        let end = start + symbol.len();
-        let before = line[..start].chars().next_back();
-        let after = line[end..].chars().next();
-        if before.map(|c| !is_ident_char(c)).unwrap_or(true)
-            && after.map(|c| !is_ident_char(c)).unwrap_or(true)
-        {
-            return Some((start, end));
+struct ParsedCacheEntry {
+    content_hash: u64,
+    tree: tree_sitter::Tree,
+}
+
+struct ParsedDocument {
+    tree: tree_sitter::Tree,
+}
+
+impl ParsedDocument {
+    fn parse(file_path: &str, content: &str) -> Option<Self> {
+        let language = tree_sitter_language_for_path(file_path)?;
+        let mut parser = Parser::new();
+        parser.set_language(&language).ok()?;
+        let parse_content = preprocess_embedded_c_for_tree_sitter(file_path, content);
+        let tree = parser.parse(parse_content.as_deref().unwrap_or(content), None)?;
+        Some(Self { tree })
+    }
+
+    fn identifier_at_point(&self, position: Point) -> Option<TsNode<'_>> {
+        let root = self.tree.root_node();
+        let leaf = root.descendant_for_point_range(position, position)?;
+        identifier_from_node_or_ancestor(leaf)
+    }
+
+    fn identifier_is_call(&self, position: Point, symbol: &str, source: &str) -> bool {
+        let Some(identifier) = self.identifier_at_point(position) else {
+            return false;
+        };
+        if text(identifier, source) != symbol {
+            return false;
         }
-        offset = end;
+        let Some(parent) = identifier.parent() else {
+            return false;
+        };
+        is_call_function_node(identifier, parent)
+    }
+
+    fn local_declaration_before(
+        &self,
+        position: Point,
+        symbol: &str,
+        source: &str,
+    ) -> Option<TsNode<'_>> {
+        let root = self.tree.root_node();
+        let cursor = root.descendant_for_point_range(position, position)?;
+        let scope = enclosing_scope(cursor).unwrap_or(root);
+        let mut best = None;
+        find_local_declaration(scope, position, symbol, source, &mut best);
+        best.map(|(_, node)| node)
+    }
+}
+
+fn stable_hash(content: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn tree_sitter_language_for_path(file_path: &str) -> Option<TsLanguage> {
+    let ext = std::path::Path::new(file_path).extension()?.to_str()?;
+    match ext {
+        "c" | "h" | "sc" | "qsc" | "qsh" => Some(tree_sitter_c::LANGUAGE.into()),
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Some(tree_sitter_cpp::LANGUAGE.into()),
+        "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
+        "go" => Some(tree_sitter_go::LANGUAGE.into()),
+        "js" | "jsx" | "mjs" | "cjs" => Some(tree_sitter_javascript::LANGUAGE.into()),
+        "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        "py" => Some(tree_sitter_python::LANGUAGE.into()),
+        "sh" | "bash" => Some(tree_sitter_bash::LANGUAGE.into()),
+        _ => None,
+    }
+}
+
+fn preprocess_embedded_c_for_tree_sitter(file_path: &str, content: &str) -> Option<String> {
+    let ext = std::path::Path::new(file_path).extension()?.to_str()?;
+    match ext {
+        "qsc" | "qsh" => Some(preprocess_equel_for_tree_sitter(content)),
+        "sc" => Some(preprocess_esql_for_tree_sitter(content)),
+        _ => None,
+    }
+}
+
+fn preprocess_equel_for_tree_sitter(content: &str) -> String {
+    content
+        .split_inclusive('\n')
+        .map(|line| {
+            let line_body = line.strip_suffix('\n').unwrap_or(line);
+            let newline = if line.ends_with('\n') { "\n" } else { "" };
+            let leading = line_body.len() - line_body.trim_start().len();
+            if line_body[leading..].starts_with("##") {
+                format!(
+                    "{}//{}{}",
+                    &line_body[..leading],
+                    &line_body[leading + 2..],
+                    newline
+                )
+            } else {
+                line.to_string()
+            }
+        })
+        .collect()
+}
+
+fn preprocess_esql_for_tree_sitter(content: &str) -> String {
+    let mut in_exec_sql = false;
+    let mut out = String::with_capacity(content.len());
+    for line in content.split_inclusive('\n') {
+        let line_body = line.strip_suffix('\n').unwrap_or(line);
+        let newline = if line.ends_with('\n') { "\n" } else { "" };
+        let starts_exec_sql = line_starts_exec_sql_lsp(line_body);
+        if in_exec_sql || starts_exec_sql {
+            out.extend(
+                line_body
+                    .chars()
+                    .map(|ch| if ch == '\t' { '\t' } else { ' ' }),
+            );
+            out.push_str(newline);
+            if line_has_trailing_semicolon_lsp(line_body) {
+                in_exec_sql = false;
+            } else if starts_exec_sql {
+                in_exec_sql = true;
+            }
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+fn line_starts_exec_sql_lsp(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.len() >= 8
+        && trimmed[..8].eq_ignore_ascii_case("exec sql")
+        && (trimmed.len() == 8
+            || trimmed.as_bytes()[8].is_ascii_whitespace()
+            || trimmed.as_bytes()[8] == b';')
+}
+
+fn line_has_trailing_semicolon_lsp(line: &str) -> bool {
+    let without_comment = line.split("/*").next().unwrap_or(line);
+    without_comment.trim_end().ends_with(';')
+}
+
+fn position_from_params(params: &Value) -> Option<Point> {
+    Some(Point {
+        row: params.pointer("/position/line").and_then(Value::as_u64)? as usize,
+        column: params
+            .pointer("/position/character")
+            .and_then(Value::as_u64)? as usize,
+    })
+}
+
+fn range_for_node(node: TsNode<'_>) -> lsp_types::Range {
+    let start = node.start_position();
+    let end = node.end_position();
+    lsp_types::Range {
+        start: lsp_types::Position {
+            line: start.row as u32,
+            character: start.column as u32,
+        },
+        end: lsp_types::Position {
+            line: end.row as u32,
+            character: end.column as u32,
+        },
+    }
+}
+
+fn text<'a>(node: TsNode<'_>, source: &'a str) -> &'a str {
+    node.utf8_text(source.as_bytes()).unwrap_or("")
+}
+
+fn identifier_from_node_or_ancestor(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+    loop {
+        if is_identifier_kind(node.kind()) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn is_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "field_identifier" | "property_identifier" | "type_identifier"
+    )
+}
+
+fn enclosing_scope(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+    loop {
+        if matches!(
+            node.kind(),
+            "function_definition"
+                | "function_item"
+                | "function_declaration"
+                | "method_definition"
+                | "method_declaration"
+                | "function_declarator"
+                | "arrow_function"
+                | "function"
+                | "method_spec"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn find_local_declaration<'a>(
+    node: TsNode<'a>,
+    position: Point,
+    symbol: &str,
+    source: &str,
+    best: &mut Option<(usize, TsNode<'a>)>,
+) {
+    if starts_after_or_at(node, position) {
+        return;
+    }
+
+    if is_local_declaration_kind(node.kind()) {
+        if let Some(identifier) = declaration_identifier(node, symbol, source) {
+            let start = identifier.start_byte();
+            if best
+                .map(|(best_start, _)| start > best_start)
+                .unwrap_or(true)
+            {
+                *best = Some((start, identifier));
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        find_local_declaration(child, position, symbol, source, best);
+    }
+}
+
+fn starts_after_or_at(node: TsNode<'_>, position: Point) -> bool {
+    let start = node.start_position();
+    start.row > position.row || (start.row == position.row && start.column >= position.column)
+}
+
+fn is_local_declaration_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "init_declarator"
+            | "declaration"
+            | "parameter_declaration"
+            | "let_declaration"
+            | "const_item"
+            | "var_declaration"
+            | "lexical_declaration"
+            | "variable_declarator"
+    )
+}
+
+fn declaration_identifier<'a>(node: TsNode<'a>, symbol: &str, source: &str) -> Option<TsNode<'a>> {
+    if let Some(name) = node.child_by_field_name("name") {
+        if is_identifier_kind(name.kind()) && text(name, source) == symbol {
+            return Some(name);
+        }
+    }
+    if let Some(declarator) = node.child_by_field_name("declarator") {
+        if let Some(identifier) = first_identifier_named(declarator, symbol, source) {
+            return Some(identifier);
+        }
+    }
+    first_identifier_named(node, symbol, source)
+}
+
+fn first_identifier_named<'a>(node: TsNode<'a>, symbol: &str, source: &str) -> Option<TsNode<'a>> {
+    if is_identifier_kind(node.kind()) && text(node, source) == symbol {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(identifier) = first_identifier_named(child, symbol, source) {
+            return Some(identifier);
+        }
     }
     None
 }
 
-fn looks_like_local_declaration(line: &str, start: usize, end: usize) -> bool {
-    let code = line
-        .split("/*")
-        .next()
-        .unwrap_or(line)
-        .split("//")
-        .next()
-        .unwrap_or(line);
-    if start >= code.len() || end > code.len() {
-        return false;
+fn is_call_function_node(identifier: TsNode<'_>, mut parent: TsNode<'_>) -> bool {
+    loop {
+        if parent.kind() == "call_expression" {
+            return parent
+                .child_by_field_name("function")
+                .map(|function| contains_node(function, identifier))
+                .unwrap_or_else(|| contains_node(parent, identifier));
+        }
+        if !matches!(
+            parent.kind(),
+            "identifier"
+                | "field_identifier"
+                | "property_identifier"
+                | "field_expression"
+                | "member_expression"
+                | "scoped_identifier"
+                | "qualified_identifier"
+        ) {
+            return false;
+        }
+        let Some(next) = parent.parent() else {
+            return false;
+        };
+        parent = next;
     }
-    let before = code[..start].trim_end();
-    let after = code[end..].trim_start();
-    if before.is_empty() || before.ends_with('.') || before.ends_with("->") {
-        return false;
-    }
-    if !matches!(after.chars().next(), Some(';' | ',' | '=' | '[')) {
-        return false;
-    }
-    let tail = before.rsplit([';', '{', '}']).next().unwrap_or(before);
-    !tail.contains('(')
 }
 
-fn identifier_span_at(line: &str, character: usize) -> Option<(usize, usize)> {
-    let chars: Vec<(usize, char)> = line.char_indices().collect();
-    if chars.is_empty() {
-        return None;
-    }
-    let mut byte_index = line.len();
-    for (char_index, (byte, _)) in chars.iter().enumerate() {
-        if char_index >= character {
-            byte_index = *byte;
-            break;
-        }
-    }
-    if byte_index == line.len() && character < chars.len() {
-        byte_index = chars[character].0;
-    }
-    let mut start = byte_index;
-    while start > 0 {
-        let Some((prev, ch)) = line[..start].char_indices().next_back() else {
-            break;
-        };
-        if !is_ident_char(ch) {
-            break;
-        }
-        start = prev;
-    }
-    let mut end = byte_index;
-    while end < line.len() {
-        let Some(ch) = line[end..].chars().next() else {
-            break;
-        };
-        if !is_ident_char(ch) {
-            break;
-        }
-        end += ch.len_utf8();
-    }
-    if start == end {
-        None
-    } else {
-        Some((start, end))
-    }
+fn contains_node(haystack: TsNode<'_>, needle: TsNode<'_>) -> bool {
+    needle.start_byte() >= haystack.start_byte() && needle.end_byte() <= haystack.end_byte()
 }
 
 #[cfg(test)]
@@ -695,6 +943,38 @@ def reconcile_account(record):
             .unwrap();
         let text = serde_json::to_string(&value).unwrap();
         assert!(text.contains("reconcile_account"), "{text}");
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn definition_prefers_tree_sitter_local_declaration_over_global_symbol() {
+        let dir = temp_project("local-definition");
+        fs::write(
+            dir.join("main.c"),
+            r#"void context(void) {}
+
+void run(void) {
+    int context = 0;
+    context = context + 1;
+}
+"#,
+        )
+        .unwrap();
+        let mut grph = Grph::init(&dir).unwrap();
+        grph.index(|_| {}).unwrap();
+
+        let handlers = LspHandlers::new(dir.clone()).unwrap();
+        let value = handlers
+            .definition(&json!({
+                "textDocument": {"uri": convert::path_to_uri(&dir, "main.c")},
+                "position": {"line": 4, "character": 4}
+            }))
+            .unwrap();
+        let location: lsp_types::Location = serde_json::from_value(value).unwrap();
+        assert_eq!(location.range.start.line, 3);
+        assert_eq!(location.range.start.character, 8);
+        assert_eq!(location.range.end.character, 15);
 
         fs::remove_dir_all(dir).ok();
     }
