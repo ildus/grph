@@ -50,7 +50,7 @@ impl CtagsGenerator {
         );
         out.push_str("!_TAG_FILE_SORTED\t1\t/0=unsorted, 1=sorted, 2=foldcase/\n");
         out.push_str("!_TAG_PROGRAM_NAME\tgrph\t//\n");
-        out.push_str("!_TAG_PROGRAM_VERSION\t0.3.0\t//\n");
+        out.push_str("!_TAG_PROGRAM_VERSION\t0.4.0\t//\n");
 
         for node in &nodes {
             out.push_str(&format_tag_line(node));

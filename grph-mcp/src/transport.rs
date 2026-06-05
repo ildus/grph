@@ -301,7 +301,7 @@ fn handle_initialize(id: Option<Value>) -> Value {
             "capabilities": {
                 "tools": {"listChanged": false}
             },
-            "serverInfo": {"name": "grph-mcp", "version": "0.3.0"},
+            "serverInfo": {"name": "grph-mcp", "version": "0.4.0"},
             "instructions": SERVER_INSTRUCTIONS
         },
         "id": id
