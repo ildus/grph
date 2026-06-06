@@ -43,6 +43,9 @@ pub fn extract(source: &str, file_path: &str) -> Result<ExtractionResult> {
     extract_sql_references(source, file_path, is_quel, &mut result);
     extract_declare_section(source, file_path, &mut result);
     extract_esql_includes(source, file_path, &mut result);
+    if is_quel {
+        extract_equel_struct_fields(source, file_path, &mut result);
+    }
 
     Ok(result)
 }
@@ -692,6 +695,195 @@ fn extract_esql_includes(source: &str, _file_path: &str, result: &mut Extraction
                 provenance: Some("esqlc-overlay".to_string()),
             });
         }
+    }
+}
+
+/// Extract EQUEL/QSH typedef-struct fields from `##` lines.
+///
+/// The C parser sees EQUEL `##` lines as comments, so generated/header-style
+/// declarations such as `## char field[32];` inside `## typedef struct ...`
+/// would otherwise be invisible to the graph, ctags, and LSP member lookup.
+fn extract_equel_struct_fields(source: &str, file_path: &str, result: &mut ExtractionResult) {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let normalized = equel_c_line(lines[i]);
+        if !normalized.contains("typedef struct") && !normalized.starts_with("struct ") {
+            i += 1;
+            continue;
+        }
+
+        let start_line = (i + 1) as u32;
+        let struct_tag = struct_tag_name(normalized);
+        let mut end = i;
+        let mut alias = None;
+        let mut saw_open_brace = normalized.contains('{');
+
+        while end + 1 < lines.len() {
+            end += 1;
+            let line = equel_c_line(lines[end]);
+            if line.contains('{') {
+                saw_open_brace = true;
+            }
+            if saw_open_brace && line.contains('}') {
+                alias = typedef_struct_alias(line).or_else(|| struct_tag.clone());
+                break;
+            }
+        }
+
+        let Some(type_name) = alias.or(struct_tag) else {
+            i += 1;
+            continue;
+        };
+        let end_line = (end + 1) as u32;
+        let struct_id = crate::extraction::tree_sitter::generate_node_id(
+            file_path,
+            NodeKind::Struct.as_str(),
+            &type_name,
+            start_line,
+        );
+
+        if !result.nodes.iter().any(|node| {
+            node.kind == NodeKind::Struct && node.name == type_name && node.start_line == start_line
+        }) {
+            result.nodes.push(Node {
+                id: struct_id.clone(),
+                kind: NodeKind::Struct,
+                name: type_name.clone(),
+                qualified_name: crate::extraction::tree_sitter::build_qualified_name(
+                    file_path, &type_name,
+                ),
+                file_path: file_path.to_string(),
+                language: Language::Esqlc,
+                start_line,
+                end_line,
+                start_column: 0,
+                end_column: lines[end].len() as u32,
+                docstring: None,
+                signature: Some(normalized.trim().to_string()),
+                visibility: None,
+                is_exported: false,
+                is_async: false,
+                is_static: false,
+                is_abstract: false,
+                decorators: None,
+                type_parameters: None,
+                updated_at: crate::extraction::tree_sitter::now_ms(),
+            });
+        }
+
+        for row in (i + 1)..end {
+            let line = lines[row];
+            let normalized = equel_c_line(line);
+            let Some(field_name) = equel_field_name(normalized) else {
+                continue;
+            };
+            let line_num = (row + 1) as u32;
+            if result.nodes.iter().any(|node| {
+                node.kind == NodeKind::Field
+                    && node.name == field_name
+                    && node.file_path == file_path
+                    && node.start_line == line_num
+            }) {
+                continue;
+            }
+            let start_col = line.find(&field_name).unwrap_or(0) as u32;
+            let field_id = crate::extraction::tree_sitter::generate_node_id(
+                file_path,
+                NodeKind::Field.as_str(),
+                &field_name,
+                line_num,
+            );
+            result.nodes.push(Node {
+                id: field_id.clone(),
+                kind: NodeKind::Field,
+                name: field_name.clone(),
+                qualified_name: format!(
+                    "{}::{}",
+                    crate::extraction::tree_sitter::build_qualified_name(file_path, &type_name),
+                    field_name
+                ),
+                file_path: file_path.to_string(),
+                language: Language::Esqlc,
+                start_line: line_num,
+                end_line: line_num,
+                start_column: start_col,
+                end_column: start_col + field_name.len() as u32,
+                docstring: None,
+                signature: Some(normalized.trim().to_string()),
+                visibility: None,
+                is_exported: false,
+                is_async: false,
+                is_static: false,
+                is_abstract: false,
+                decorators: None,
+                type_parameters: None,
+                updated_at: crate::extraction::tree_sitter::now_ms(),
+            });
+            result.edges.push(Edge {
+                source: struct_id.clone(),
+                target: field_id,
+                kind: EdgeKind::Contains,
+                metadata: None,
+                line: Some(line_num),
+                col: Some(start_col),
+                provenance: Some("esqlc-overlay".to_string()),
+            });
+        }
+
+        i = end.saturating_add(1);
+    }
+}
+
+fn equel_c_line(line: &str) -> &str {
+    line.trim_start()
+        .strip_prefix("##")
+        .unwrap_or(line)
+        .trim_start()
+}
+
+fn struct_tag_name(line: &str) -> Option<String> {
+    let re = Regex::new(r"\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)").ok()?;
+    let tag = re.captures(line)?.get(1)?.as_str();
+    Some(tag.trim_start_matches('_').to_string()).filter(|name| !name.is_empty())
+}
+
+fn typedef_struct_alias(line: &str) -> Option<String> {
+    let after = line.split('}').nth(1)?.trim();
+    let re = Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)\b").ok()?;
+    re.captures(after)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+fn equel_field_name(line: &str) -> Option<String> {
+    let declaration = line.split("/*").next().unwrap_or(line).trim();
+    if declaration.is_empty()
+        || declaration.starts_with('#')
+        || declaration.starts_with('{')
+        || declaration.starts_with('}')
+        || declaration.contains("typedef")
+        || declaration.contains('(')
+    {
+        return None;
+    }
+
+    let before_semicolon = declaration.trim_end_matches(';').trim();
+    let before_array = before_semicolon
+        .split('[')
+        .next()
+        .unwrap_or(before_semicolon)
+        .trim_end();
+    let re = Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*$").ok()?;
+    let name = re.captures(before_array)?.get(1)?.as_str();
+    if matches!(
+        name,
+        "char" | "int" | "i1" | "i2" | "i4" | "bool" | "struct" | "enum"
+    ) {
+        None
+    } else {
+        Some(name.to_string())
     }
 }
 

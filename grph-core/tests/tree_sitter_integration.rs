@@ -307,6 +307,40 @@ char    *nrmltblname;
 }
 
 #[test]
+fn extracts_equel_qsh_struct_fields_from_hash_lines() {
+    let source = r#"
+##  typedef struct _SAMPLE_ENV
+##  {
+##      i4      access_mode;
+##      char    passphrase[256];
+##  } SAMPLE_ENV;
+"#;
+    let result = extract_for_language(Language::Esqlc, source, "sample_env.qsh").unwrap();
+
+    assert!(node_names(&result, NodeKind::Struct).contains(&"SAMPLE_ENV".to_string()));
+    assert!(node_names(&result, NodeKind::Field).contains(&"access_mode".to_string()));
+    assert!(node_names(&result, NodeKind::Field).contains(&"passphrase".to_string()));
+
+    let strukt = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Struct && n.name == "SAMPLE_ENV")
+        .unwrap();
+    let field = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Field && n.name == "passphrase")
+        .unwrap();
+    assert_eq!(
+        field.qualified_name,
+        "sample_env.qsh#SAMPLE_ENV::passphrase"
+    );
+    assert!(result.edges.iter().any(|e| {
+        e.kind == EdgeKind::Contains && e.source == strukt.id && e.target == field.id
+    }));
+}
+
+#[test]
 fn extracts_shell_tree_sitter_symbols_calls_and_imports() {
     let source = r#"
 #!/usr/bin/env bash

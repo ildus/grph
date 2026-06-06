@@ -495,7 +495,10 @@ impl LspHandlers {
             .collect::<Vec<_>>();
 
         if let Some(type_name) = receiver_type.as_deref() {
-            if let Some(node) = fields.iter().find(|node| field_matches_type(node, type_name, symbol)) {
+            if let Some(node) = fields
+                .iter()
+                .find(|node| field_matches_type(node, type_name, symbol))
+            {
                 return Ok(convert::node_location(&self.root, node));
             }
         }
@@ -685,7 +688,12 @@ impl ParsedDocument {
         identifier_from_node_or_ancestor(leaf)
     }
 
-    fn member_access_at(&self, position: Point, symbol: &str, source: &str) -> Option<MemberAccess> {
+    fn member_access_at(
+        &self,
+        position: Point,
+        symbol: &str,
+        source: &str,
+    ) -> Option<MemberAccess> {
         let identifier = self.identifier_at_point(position)?;
         if text(identifier, source) != symbol {
             return None;
@@ -882,7 +890,9 @@ fn local_equel_declaration_before(
 
 fn is_esql_like_path(file_path: &str) -> bool {
     matches!(
-        std::path::Path::new(file_path).extension().and_then(|ext| ext.to_str()),
+        std::path::Path::new(file_path)
+            .extension()
+            .and_then(|ext| ext.to_str()),
         Some("sc" | "qsc" | "qsh")
     )
 }
@@ -910,7 +920,8 @@ fn identifier_boundary(text: &str, start: usize, end: usize) -> bool {
 
 fn looks_like_c_declaration_prefix(prefix: &str) -> bool {
     let trimmed = prefix.trim();
-    if trimmed.is_empty() || trimmed.contains('(') || trimmed.contains(')') || trimmed.contains('=') {
+    if trimmed.is_empty() || trimmed.contains('(') || trimmed.contains(')') || trimmed.contains('=')
+    {
         return false;
     }
 
@@ -926,8 +937,7 @@ fn looks_like_c_declaration_prefix(prefix: &str) -> bool {
 
     !matches!(
         first.to_ascii_lowercase().as_str(),
-        "if"
-            | "for"
+        "if" | "for"
             | "while"
             | "switch"
             | "return"
@@ -974,7 +984,10 @@ fn member_access_from_identifier(identifier: TsNode<'_>, source: &str) -> Option
                 }
             }
         }
-        if !matches!(parent.kind(), "field_identifier" | "property_identifier" | "identifier") {
+        if !matches!(
+            parent.kind(),
+            "field_identifier" | "property_identifier" | "identifier"
+        ) {
             return member_access_from_line(identifier, source);
         }
         current = parent;
@@ -1074,8 +1087,11 @@ fn clean_declared_type(raw: &str) -> Option<String> {
 }
 
 fn field_matches_type(node: &Node, type_name: &str, field: &str) -> bool {
-    node.qualified_name.ends_with(&format!("#{type_name}::{field}"))
-        || node.qualified_name.ends_with(&format!("::{type_name}::{field}"))
+    node.qualified_name
+        .ends_with(&format!("#{type_name}::{field}"))
+        || node
+            .qualified_name
+            .ends_with(&format!("::{type_name}::{field}"))
 }
 
 fn identifier_from_node_or_ancestor(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
@@ -1328,7 +1344,6 @@ generic_handler(DU_ERROR *errcb, i4 error)
 
         fs::remove_dir_all(dir).ok();
     }
-
 
     #[test]
     fn definition_resolves_c_member_field_by_receiver_type() {
