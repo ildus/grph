@@ -486,6 +486,101 @@ class DBIter : public Iterator {
 }
 
 #[test]
+fn extracts_c_enum_members_struct_fields_and_prototypes() {
+    let source = r#"
+typedef enum { Red = 1, Green } Color;
+typedef struct { int value; const char *name; int (*callback)(void); } Widget;
+void exported(const Widget *widget);
+"#;
+    let result = extract_for_language(Language::C, source, "api.h").unwrap();
+
+    assert!(node_names(&result, NodeKind::Enum).contains(&"Color".to_string()));
+    assert!(node_names(&result, NodeKind::EnumMember).contains(&"Red".to_string()));
+    assert!(node_names(&result, NodeKind::EnumMember).contains(&"Green".to_string()));
+    assert!(node_names(&result, NodeKind::Field).contains(&"value".to_string()));
+    assert!(node_names(&result, NodeKind::Field).contains(&"name".to_string()));
+    assert!(node_names(&result, NodeKind::Field).contains(&"callback".to_string()));
+    assert!(node_names(&result, NodeKind::Function).contains(&"exported".to_string()));
+
+    let color = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Enum && n.name == "Color")
+        .unwrap();
+    let red = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::EnumMember && n.name == "Red")
+        .unwrap();
+    assert_eq!(red.qualified_name, "api.h#Color::Red");
+    assert!(result
+        .edges
+        .iter()
+        .any(|e| e.kind == EdgeKind::Contains && e.source == color.id && e.target == red.id));
+
+    let widget = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Struct && n.name == "Widget")
+        .unwrap();
+    let value = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Field && n.name == "value")
+        .unwrap();
+    assert_eq!(value.qualified_name, "api.h#Widget::value");
+    assert!(result
+        .edges
+        .iter()
+        .any(|e| e.kind == EdgeKind::Contains && e.source == widget.id && e.target == value.id));
+}
+
+#[test]
+fn extracts_cpp_method_declarations_and_qualified_names() {
+    let source = r#"
+class App {
+ public:
+  App();
+  ~App();
+  int run(int argc);
+  bool operator==(const App& other) const;
+ private:
+  int count;
+};
+"#;
+    let result = extract_for_language(Language::Cpp, source, "app.hpp").unwrap();
+
+    assert!(node_names(&result, NodeKind::Class).contains(&"App".to_string()));
+    assert!(node_names(&result, NodeKind::Method).contains(&"App".to_string()));
+    assert!(node_names(&result, NodeKind::Method).contains(&"~App".to_string()));
+    assert!(node_names(&result, NodeKind::Method).contains(&"run".to_string()));
+    assert!(node_names(&result, NodeKind::Method).contains(&"operator==".to_string()));
+    assert!(node_names(&result, NodeKind::Field).contains(&"count".to_string()));
+
+    let class = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Class && n.name == "App")
+        .unwrap();
+    let run = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Method && n.name == "run")
+        .unwrap();
+    let count = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Field && n.name == "count")
+        .unwrap();
+    assert_eq!(run.qualified_name, "app.hpp#App::run");
+    assert_eq!(count.qualified_name, "app.hpp#App::count");
+    assert!(result
+        .edges
+        .iter()
+        .any(|e| e.kind == EdgeKind::Contains && e.source == class.id && e.target == run.id));
+}
+
+#[test]
 fn extracts_rust_trait_relationships() {
     let source = r#"
 pub struct MyCache {}

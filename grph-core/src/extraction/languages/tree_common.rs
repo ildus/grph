@@ -86,6 +86,7 @@ impl<'a> ExtractCtx<'a> {
                     &name,
                     Some(signature(node, self.source)),
                     visibility(node, self.source),
+                    current_container.as_deref(),
                 );
                 let id = symbol.id.clone();
                 if let Some(parent_id) = current_container.as_ref() {
@@ -98,6 +99,15 @@ impl<'a> ExtractCtx<'a> {
                     ));
                 }
                 self.nodes.push(symbol);
+                let child_container = if matches!(
+                    node_kind,
+                    NodeKind::Struct | NodeKind::Enum | NodeKind::Class
+                ) {
+                    Some(id)
+                } else {
+                    current_container.clone()
+                };
+                self.walk_children(node, child_container, current_function);
                 return;
             }
         }
@@ -120,6 +130,7 @@ impl<'a> ExtractCtx<'a> {
                     &name,
                     Some(signature(node, self.source)),
                     visibility(node, self.source),
+                    current_container.as_deref(),
                 );
                 let id = symbol.id.clone();
                 if let Some(parent_id) = current_container.as_ref() {
@@ -154,6 +165,7 @@ impl<'a> ExtractCtx<'a> {
                     &name,
                     Some(signature(node, self.source)),
                     visibility(node, self.source),
+                    current_container.as_deref(),
                 );
                 let id = symbol.id.clone();
                 if let Some(parent_id) = current_container.as_ref() {
@@ -173,6 +185,92 @@ impl<'a> ExtractCtx<'a> {
             }
         }
 
+        if self.is_c_like() {
+            if kind == "enumerator" {
+                if let Some(name) = node_name(node, self.source) {
+                    let symbol = self.make_node(
+                        node,
+                        NodeKind::EnumMember,
+                        &name,
+                        Some(signature(node, self.source)),
+                        visibility(node, self.source),
+                        current_container.as_deref(),
+                    );
+                    let id = symbol.id.clone();
+                    if let Some(parent_id) = current_container.as_ref() {
+                        self.edges.push(make_edge(
+                            parent_id,
+                            &id,
+                            EdgeKind::Contains,
+                            node,
+                            "tree-sitter",
+                        ));
+                    }
+                    self.nodes.push(symbol);
+                    return;
+                }
+            }
+
+            if matches!(kind, "declaration" | "field_declaration")
+                && (kind == "declaration"
+                    || (self.cfg.language == Language::Cpp && current_container.is_some()))
+            {
+                if let Some(name) = function_declaration_name(node, self.source) {
+                    let node_kind =
+                        if current_container.is_some() && self.cfg.language == Language::Cpp {
+                            NodeKind::Method
+                        } else {
+                            NodeKind::Function
+                        };
+                    let symbol = self.make_node(
+                        node,
+                        node_kind,
+                        &name,
+                        Some(signature(node, self.source)),
+                        visibility(node, self.source),
+                        current_container.as_deref(),
+                    );
+                    let id = symbol.id.clone();
+                    if let Some(parent_id) = current_container.as_ref() {
+                        self.edges.push(make_edge(
+                            parent_id,
+                            &id,
+                            EdgeKind::Contains,
+                            node,
+                            "tree-sitter",
+                        ));
+                    }
+                    self.nodes.push(symbol);
+                    return;
+                }
+            }
+
+            if kind == "field_declaration" && current_container.is_some() {
+                for name in field_declaration_names(node, self.source) {
+                    let symbol = self.make_node(
+                        node,
+                        NodeKind::Field,
+                        &name,
+                        Some(signature(node, self.source)),
+                        visibility(node, self.source),
+                        current_container.as_deref(),
+                    );
+                    let id = symbol.id.clone();
+                    if let Some(parent_id) = current_container.as_ref() {
+                        self.edges.push(make_edge(
+                            parent_id,
+                            &id,
+                            EdgeKind::Contains,
+                            node,
+                            "tree-sitter",
+                        ));
+                    }
+                    self.nodes.push(symbol);
+                }
+                return;
+            }
+        }
+
         if contains(self.cfg.import_kinds, kind) {
             let import_text = text(node, self.source).trim();
             let name = cleanup_import_name(import_text, self.cfg.language);
@@ -183,6 +281,7 @@ impl<'a> ExtractCtx<'a> {
                     &name,
                     Some(import_text.to_string()),
                     visibility(node, self.source),
+                    None,
                 );
                 let id = symbol.id.clone();
                 self.edges.push(make_edge(
@@ -204,6 +303,7 @@ impl<'a> ExtractCtx<'a> {
                     &name,
                     Some(signature(node, self.source)),
                     visibility(node, self.source),
+                    None,
                 );
                 let id = symbol.id.clone();
                 self.collect_identifier_references(node, &id, &name);
@@ -220,6 +320,7 @@ impl<'a> ExtractCtx<'a> {
                         &name,
                         Some(signature(node, self.source)),
                         visibility(node, self.source),
+                        current_container.as_deref(),
                     );
                     let id = symbol.id.clone();
                     self.nodes.push(symbol);
@@ -234,6 +335,7 @@ impl<'a> ExtractCtx<'a> {
                     &name,
                     Some(signature(node, self.source)),
                     visibility(node, self.source),
+                    current_container.as_deref(),
                 );
                 let id = symbol.id.clone();
                 self.extract_initializer_references(node, &id, &name);
@@ -286,6 +388,15 @@ impl<'a> ExtractCtx<'a> {
         }
     }
 
+    fn qualified_name_for(&self, name: &str, container_id: Option<&str>) -> String {
+        if let Some(container_id) = container_id {
+            if let Some(container) = self.nodes.iter().find(|node| node.id == container_id) {
+                return format!("{}::{}", container.qualified_name, name);
+            }
+        }
+        build_qualified_name(self.file_path, name)
+    }
+
     fn make_node(
         &self,
         node: TsNode<'a>,
@@ -293,6 +404,7 @@ impl<'a> ExtractCtx<'a> {
         name: &str,
         signature: Option<String>,
         visibility: Option<String>,
+        container_id: Option<&str>,
     ) -> Node {
         let start = node.start_position();
         let end = node.end_position();
@@ -300,7 +412,7 @@ impl<'a> ExtractCtx<'a> {
             id: generate_node_id(self.file_path, kind.as_str(), name, (start.row + 1) as u32),
             kind,
             name: name.to_string(),
-            qualified_name: build_qualified_name(self.file_path, name),
+            qualified_name: self.qualified_name_for(name, container_id),
             file_path: self.file_path.to_string(),
             language: self.cfg.language,
             start_line: (start.row + 1) as u32,
@@ -318,6 +430,13 @@ impl<'a> ExtractCtx<'a> {
             type_parameters: None,
             updated_at: now_ms(),
         }
+    }
+
+    fn is_c_like(&self) -> bool {
+        matches!(
+            self.cfg.language,
+            Language::C | Language::Cpp | Language::Esqlc
+        )
     }
 
     fn is_js_like_variable_function(&self, node: TsNode<'a>) -> bool {
@@ -785,6 +904,10 @@ fn is_identifier_kind(kind: &str) -> bool {
             | "type_identifier"
             | "field_identifier"
             | "namespace_identifier"
+            | "qualified_identifier"
+            | "scoped_identifier"
+            | "destructor_name"
+            | "operator_name"
     )
 }
 
@@ -802,8 +925,22 @@ fn shallow_identifier_in(node: TsNode<'_>, source: &str) -> Option<String> {
 }
 
 fn declarator_identifier(node: TsNode<'_>, source: &str) -> Option<String> {
+    if matches!(node.kind(), "qualified_identifier" | "scoped_identifier") {
+        return leaf_identifier_text(node, source);
+    }
     if is_identifier_kind(node.kind()) {
         return Some(text(node, source).trim().to_string()).filter(|s| !s.is_empty());
+    }
+
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if let Some(name) = declarator_identifier(name_node, source) {
+            return Some(name);
+        }
+    }
+    if let Some(decl_node) = node.child_by_field_name("declarator") {
+        if let Some(name) = declarator_identifier(decl_node, source) {
+            return Some(name);
+        }
     }
 
     // Prefer the identifier that belongs to the declarator rather than identifiers
@@ -813,7 +950,16 @@ fn declarator_identifier(node: TsNode<'_>, source: &str) -> Option<String> {
     for child in node.children(&mut cursor) {
         if matches!(
             child.kind(),
-            "parameter_list" | "field_declaration_list" | "compound_statement"
+            "parameter_list"
+                | "field_declaration_list"
+                | "compound_statement"
+                | "initializer_list"
+                | "argument_list"
+                | "primitive_type"
+                | "type_identifier"
+                | "sized_type_specifier"
+                | "type_qualifier"
+                | "storage_class_specifier"
         ) {
             continue;
         }
@@ -822,6 +968,106 @@ fn declarator_identifier(node: TsNode<'_>, source: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn leaf_identifier_text(node: TsNode<'_>, source: &str) -> Option<String> {
+    if matches!(
+        node.kind(),
+        "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "namespace_identifier"
+            | "destructor_name"
+            | "operator_name"
+    ) {
+        return Some(text(node, source).trim().to_string()).filter(|s| !s.is_empty());
+    }
+
+    let mut found = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(name) = leaf_identifier_text(child, source) {
+            found = Some(name);
+        }
+    }
+    found.or_else(|| {
+        let raw = text(node, source).trim();
+        raw.rsplit("::")
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn function_declaration_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    let function = find_descendant_kind(node, "function_declarator")?;
+    let declarator = function
+        .child_by_field_name("declarator")
+        .or_else(|| function.child_by_field_name("name"))
+        .unwrap_or(function);
+    declarator_identifier(declarator, source)
+}
+
+fn find_descendant_kind<'a>(node: TsNode<'a>, target: &str) -> Option<TsNode<'a>> {
+    if node.kind() == target {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if matches!(child.kind(), "compound_statement" | "parameter_list") {
+            continue;
+        }
+        if let Some(found) = find_descendant_kind(child, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn field_declaration_names(node: TsNode<'_>, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_field_declaration_names(node, source, &mut names);
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn collect_field_declaration_names(node: TsNode<'_>, source: &str, names: &mut Vec<String>) {
+    if node.kind() == "function_declarator" {
+        if let Some(name) = declarator_identifier(node, source) {
+            names.push(name);
+        }
+        return;
+    }
+    if matches!(node.kind(), "parameter_list" | "compound_statement") {
+        return;
+    }
+    if matches!(node.kind(), "field_identifier" | "identifier") {
+        let name = text(node, source).trim();
+        if !name.is_empty() {
+            names.push(name.to_string());
+        }
+        return;
+    }
+    if let Some(decl) = node.child_by_field_name("declarator") {
+        collect_field_declaration_names(decl, source, names);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "primitive_type"
+                | "type_identifier"
+                | "type_qualifier"
+                | "storage_class_specifier"
+                | "sized_type_specifier"
+        ) {
+            continue;
+        }
+        collect_field_declaration_names(child, source, names);
+    }
 }
 
 fn typedef_alias_name(node: TsNode<'_>, source: &str) -> Option<String> {
