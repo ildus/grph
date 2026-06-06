@@ -728,35 +728,42 @@ impl ExtractionOrchestrator {
         self.db.delete_file_nodes(&relative_path)?;
         self.db.delete_unresolved_refs_for_file(&relative_path)?;
 
-        for node in &extraction.nodes {
-            self.db.insert_node(node)?;
-        }
-
-        for edge in &extraction.edges {
-            self.db.insert_edge(edge)?;
-        }
+        self.db.batch_insert_nodes(&extraction.nodes)?;
+        self.db.batch_insert_edges(&extraction.edges)?;
 
         let node_ids: HashSet<&str> = extraction.nodes.iter().map(|n| n.id.as_str()).collect();
+        let mut unresolved_refs = Vec::new();
+        let mut seen_unresolved = HashSet::new();
         for edge in &extraction.edges {
             if !node_ids.contains(edge.target.as_str())
                 && should_track_unresolved_reference(&edge.target, edge.kind, language)
             {
-                let unresolved = UnresolvedRef {
+                let line = edge.line.unwrap_or(0);
+                let col = edge.col.unwrap_or(0);
+                let key = (
+                    edge.source.as_str(),
+                    edge.target.as_str(),
+                    edge.kind,
+                    line,
+                    col,
+                );
+                if !seen_unresolved.insert(key) {
+                    continue;
+                }
+                unresolved_refs.push(UnresolvedRef {
                     id: None,
                     from_node_id: edge.source.clone(),
                     reference_name: edge.target.clone(),
                     reference_kind: edge.kind.as_str().to_string(),
-                    line: edge.line.unwrap_or(0),
-                    col: edge.col.unwrap_or(0),
+                    line,
+                    col,
                     candidates: None,
                     file_path: relative_path.clone(),
                     language: language.as_str().to_string(),
-                };
-                if let Err(e) = self.db.insert_unresolved_ref(&unresolved) {
-                    eprintln!("WARN: Failed to insert unresolved ref: {}", e);
-                }
+                });
             }
         }
+        self.db.batch_insert_unresolved_refs(&unresolved_refs)?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

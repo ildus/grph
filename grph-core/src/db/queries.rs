@@ -42,6 +42,54 @@ impl Database {
         Ok(())
     }
 
+    pub fn batch_insert_nodes(&self, nodes: &[Node]) -> Result<()> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self.conn().prepare(
+            "INSERT OR REPLACE INTO nodes (
+                id, kind, name, qualified_name, file_path, language,
+                start_line, end_line, start_column, end_column,
+                docstring, signature, visibility,
+                is_exported, is_async, is_static, is_abstract,
+                decorators, type_parameters, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        )?;
+        for node in nodes {
+            let decorators_json = node
+                .decorators
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok());
+            let type_parameters_json = node
+                .type_parameters
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok());
+            stmt.execute(params![
+                &node.id,
+                node.kind.as_str(),
+                &node.name,
+                &node.qualified_name,
+                &node.file_path,
+                node.language.as_str(),
+                node.start_line,
+                node.end_line,
+                node.start_column,
+                node.end_column,
+                node.docstring.as_deref(),
+                node.signature.as_deref(),
+                node.visibility.as_deref(),
+                node.is_exported as i32,
+                node.is_async as i32,
+                node.is_static as i32,
+                node.is_abstract as i32,
+                decorators_json.as_deref(),
+                type_parameters_json.as_deref(),
+                node.updated_at,
+            ])?;
+        }
+        Ok(())
+    }
+
     pub fn list_nodes_for_ctags(&self) -> Result<Vec<Node>> {
         let mut stmt = self.conn().prepare(
             "SELECT id, kind, name, qualified_name, file_path, language,
@@ -365,11 +413,28 @@ impl Database {
     }
 
     pub fn batch_insert_edges(&self, edges: &[Edge]) -> Result<()> {
-        self.conn().execute_batch("BEGIN TRANSACTION")?;
-        for edge in edges {
-            self.insert_edge(edge)?;
+        if edges.is_empty() {
+            return Ok(());
         }
-        self.conn().execute_batch("COMMIT")?;
+        let mut stmt = self.conn().prepare(
+            "INSERT INTO edges (source, target, kind, metadata, line, col, provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for edge in edges {
+            let metadata_json = edge
+                .metadata
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok());
+            stmt.execute(params![
+                &edge.source,
+                &edge.target,
+                edge.kind.as_str(),
+                metadata_json.as_deref(),
+                edge.line.map(|l| l as i64),
+                edge.col.map(|c| c as i64),
+                edge.provenance.as_deref(),
+            ])?;
+        }
         Ok(())
     }
 
@@ -886,6 +951,33 @@ impl Database {
                 unresolved.language,
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn batch_insert_unresolved_refs(&self, unresolved_refs: &[UnresolvedRef]) -> Result<()> {
+        if unresolved_refs.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self.conn().prepare(
+            "INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for unresolved in unresolved_refs {
+            let candidates_json = unresolved
+                .candidates
+                .as_ref()
+                .map(|c| serde_json::to_string(c).unwrap_or_default());
+            stmt.execute(params![
+                &unresolved.from_node_id,
+                &unresolved.reference_name,
+                &unresolved.reference_kind,
+                unresolved.line,
+                unresolved.col,
+                candidates_json.as_deref(),
+                &unresolved.file_path,
+                &unresolved.language,
+            ])?;
+        }
         Ok(())
     }
 
