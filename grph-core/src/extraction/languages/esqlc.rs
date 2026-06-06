@@ -723,11 +723,13 @@ fn extract_equel_struct_fields(source: &str, file_path: &str, result: &mut Extra
         while end + 1 < lines.len() {
             end += 1;
             let line = equel_c_line(lines[end]);
-            if line.contains('{') {
+            let code_owned = strip_c_line_noise(line);
+            let code = code_owned.trim();
+            if code.contains('{') {
                 saw_open_brace = true;
             }
-            if saw_open_brace && line.contains('}') {
-                alias = typedef_struct_alias(line).or_else(|| struct_tag.clone());
+            if saw_open_brace && code.contains('}') {
+                alias = typedef_struct_alias(code).or_else(|| struct_tag.clone());
                 break;
             }
         }
@@ -858,11 +860,15 @@ fn typedef_struct_alias(line: &str) -> Option<String> {
 }
 
 fn equel_field_name(line: &str) -> Option<String> {
-    let declaration = line.split("/*").next().unwrap_or(line).trim();
+    let code = strip_c_line_noise(line);
+    let declaration = code.trim();
     if declaration.is_empty()
         || declaration.starts_with('#')
         || declaration.starts_with('{')
         || declaration.starts_with('}')
+        || declaration.starts_with("**")
+        || declaration.starts_with("*/")
+        || declaration.starts_with("/*")
         || declaration.contains("typedef")
         || declaration.contains('(')
     {

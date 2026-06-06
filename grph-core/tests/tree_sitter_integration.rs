@@ -313,6 +313,10 @@ fn extracts_equel_qsh_struct_fields_from_hash_lines() {
 ##  {
 ##      i4      access_mode;
 ##      char    passphrase[256];
+##      char    delim_case[8];       /* {UPPER,LOWER,MIXED} */
+        char    collation[256];      /* regular C field after brace comment */
+        i4      uninorm_flag;
+##      char    tail_name[64];
 ##  } SAMPLE_ENV;
 "#;
     let result = extract_for_language(Language::Esqlc, source, "sample_env.qsh").unwrap();
@@ -320,6 +324,10 @@ fn extracts_equel_qsh_struct_fields_from_hash_lines() {
     assert!(node_names(&result, NodeKind::Struct).contains(&"SAMPLE_ENV".to_string()));
     assert!(node_names(&result, NodeKind::Field).contains(&"access_mode".to_string()));
     assert!(node_names(&result, NodeKind::Field).contains(&"passphrase".to_string()));
+    assert!(node_names(&result, NodeKind::Field).contains(&"delim_case".to_string()));
+    assert!(node_names(&result, NodeKind::Field).contains(&"collation".to_string()));
+    assert!(node_names(&result, NodeKind::Field).contains(&"uninorm_flag".to_string()));
+    assert!(node_names(&result, NodeKind::Field).contains(&"tail_name".to_string()));
 
     let strukt = result
         .nodes
