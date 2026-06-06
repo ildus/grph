@@ -1,5 +1,5 @@
 use crate::convert;
-use grph_core::{Edge, Grph, Node};
+use grph_core::{Edge, Grph, Node, NodeKind};
 use lsp_types::{CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall};
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -70,6 +70,13 @@ impl LspHandlers {
             return Ok(None);
         };
 
+        // Prefer indexed fields for member access (`obj.field` / `obj->field`).
+        // Plain lowercase fields are otherwise blocked from global lookup to avoid
+        // jumping local variables to arbitrary workspace symbols.
+        if let Some(location) = self.member_field_definition(params, &file_path, &symbol)? {
+            return Ok(Some(location));
+        }
+
         // Prefer a tree-sitter local declaration for non-call identifiers. This keeps
         // go-to-definition on local C variables such as context from resolving to
         // a same-file/global function with a common name, while still letting
@@ -93,10 +100,17 @@ impl LspHandlers {
             }
         }
 
-        Ok(self
-            .node_at_params(params)?
-            .as_ref()
-            .and_then(|node| convert::node_location(&self.root, node)))
+        // Last resort: only return the position-based node if the cursor symbol
+        // is that node's own name. Otherwise an unresolved local/reference inside
+        // a large recovered C/ESQL function can incorrectly jump to the enclosing
+        // function definition.
+        Ok(self.node_at_params(params)?.as_ref().and_then(|node| {
+            if node.name == symbol {
+                convert::node_location(&self.root, node)
+            } else {
+                None
+            }
+        }))
     }
 
     pub fn references(&self, params: &Value) -> grph_core::Result<Value> {
@@ -435,11 +449,70 @@ impl LspHandlers {
     ) -> Option<lsp_types::Location> {
         let position = position_from_params(params)?;
         let (content, parsed) = self.parsed_document(params, file_path)?;
-        let declaration = parsed.local_declaration_before(position, symbol, &content)?;
-        Some(lsp_types::Location {
-            uri: lsp_types::Uri::from_str(&convert::path_to_uri(&self.root, file_path)).ok()?,
-            range: range_for_node(declaration),
-        })
+        let uri = lsp_types::Uri::from_str(&convert::path_to_uri(&self.root, file_path)).ok()?;
+
+        if let Some(declaration) = parsed.local_declaration_before(position, symbol, &content) {
+            return Some(lsp_types::Location {
+                uri,
+                range: range_for_node(declaration),
+            });
+        }
+
+        // ESQL/EQUEL C lines beginning with `##` are preprocessed for tree-sitter
+        // as comments so the parser can recover the surrounding C. That means local
+        // declarations such as `## char case_semantics[6];` are invisible to the
+        // tree-sitter local-declaration pass above. Recover those declarations from
+        // the original buffer so go-to-definition does not fall back to the
+        // enclosing recovered function range.
+        local_equel_declaration_before(file_path, &content, position, symbol)
+            .map(|range| lsp_types::Location { uri, range })
+    }
+
+    fn member_field_definition(
+        &self,
+        params: &Value,
+        file_path: &str,
+        symbol: &str,
+    ) -> grph_core::Result<Option<lsp_types::Location>> {
+        let Some((content, parsed)) = self.parsed_document(params, file_path) else {
+            return Ok(None);
+        };
+        let Some(position) = position_from_params(params) else {
+            return Ok(None);
+        };
+        let Some(access) = parsed.member_access_at(position, symbol, &content) else {
+            return Ok(None);
+        };
+
+        let receiver_type = parsed
+            .local_declaration_before(position, &access.receiver, &content)
+            .and_then(|identifier| declared_type_for_identifier(identifier, &content));
+
+        let candidates = self.grph.db().get_nodes_by_name_all(symbol, 100)?;
+        let fields = candidates
+            .into_iter()
+            .filter(|node| node.kind == NodeKind::Field)
+            .collect::<Vec<_>>();
+
+        if let Some(type_name) = receiver_type.as_deref() {
+            if let Some(node) = fields.iter().find(|node| field_matches_type(node, type_name, symbol)) {
+                return Ok(convert::node_location(&self.root, node));
+            }
+        }
+
+        if fields.is_empty() {
+            return Ok(None);
+        }
+
+        if let Some(node) = fields.iter().find(|node| node.file_path == file_path) {
+            return Ok(convert::node_location(&self.root, node));
+        }
+
+        if fields.len() == 1 {
+            return Ok(convert::node_location(&self.root, &fields[0]));
+        }
+
+        Ok(None)
     }
 
     fn should_global_lookup(&self, params: &Value, file_path: &str, symbol: &str) -> bool {
@@ -612,6 +685,14 @@ impl ParsedDocument {
         identifier_from_node_or_ancestor(leaf)
     }
 
+    fn member_access_at(&self, position: Point, symbol: &str, source: &str) -> Option<MemberAccess> {
+        let identifier = self.identifier_at_point(position)?;
+        if text(identifier, source) != symbol {
+            return None;
+        }
+        member_access_from_identifier(identifier, source)
+    }
+
     fn identifier_is_call(&self, position: Point, symbol: &str, source: &str) -> bool {
         let Some(identifier) = self.identifier_at_point(position) else {
             return false;
@@ -756,8 +837,245 @@ fn range_for_node(node: TsNode<'_>) -> lsp_types::Range {
     }
 }
 
+fn local_equel_declaration_before(
+    file_path: &str,
+    content: &str,
+    position: Point,
+    symbol: &str,
+) -> Option<lsp_types::Range> {
+    if !is_esql_like_path(file_path) {
+        return None;
+    }
+
+    let mut best: Option<lsp_types::Range> = None;
+    for (row, line) in content.lines().enumerate() {
+        if row > position.row {
+            break;
+        }
+        if row == position.row {
+            // Keep same behavior as tree-sitter local lookup: declaration must
+            // start before the cursor line for this ESQL fallback.
+            break;
+        }
+
+        let Some(marker) = line.find("##") else {
+            continue;
+        };
+        let statement = &line[marker + 2..];
+        let Some(offset) = declaration_symbol_offset(statement, symbol) else {
+            continue;
+        };
+        let start_col = marker + 2 + offset;
+        best = Some(lsp_types::Range {
+            start: lsp_types::Position {
+                line: row as u32,
+                character: start_col as u32,
+            },
+            end: lsp_types::Position {
+                line: row as u32,
+                character: (start_col + symbol.len()) as u32,
+            },
+        });
+    }
+    best
+}
+
+fn is_esql_like_path(file_path: &str) -> bool {
+    matches!(
+        std::path::Path::new(file_path).extension().and_then(|ext| ext.to_str()),
+        Some("sc" | "qsc" | "qsh")
+    )
+}
+
+fn declaration_symbol_offset(statement: &str, symbol: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(relative) = statement[search_from..].find(symbol) {
+        let idx = search_from + relative;
+        let end = idx + symbol.len();
+        if identifier_boundary(statement, idx, end)
+            && looks_like_c_declaration_prefix(&statement[..idx])
+        {
+            return Some(idx);
+        }
+        search_from = end;
+    }
+    None
+}
+
+fn identifier_boundary(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    !before.map_or(false, is_ident_char) && !after.map_or(false, is_ident_char)
+}
+
+fn looks_like_c_declaration_prefix(prefix: &str) -> bool {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() || trimmed.contains('(') || trimmed.contains(')') || trimmed.contains('=') {
+        return false;
+    }
+
+    let first = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches('*')
+        .trim();
+    if first.is_empty() {
+        return false;
+    }
+
+    !matches!(
+        first.to_ascii_lowercase().as_str(),
+        "if"
+            | "for"
+            | "while"
+            | "switch"
+            | "return"
+            | "sizeof"
+            | "exec"
+            | "inquire_equel"
+            | "ingres"
+            | "append"
+            | "replace"
+            | "delete"
+            | "select"
+            | "open"
+            | "fetch"
+            | "close"
+    )
+}
+
 fn text<'a>(node: TsNode<'_>, source: &'a str) -> &'a str {
     node.utf8_text(source.as_bytes()).unwrap_or("")
+}
+
+struct MemberAccess {
+    receiver: String,
+}
+
+fn member_access_from_identifier(identifier: TsNode<'_>, source: &str) -> Option<MemberAccess> {
+    let mut current = identifier;
+    loop {
+        let parent = current.parent()?;
+        if matches!(parent.kind(), "field_expression" | "member_expression") {
+            if let Some(field) = parent
+                .child_by_field_name("field")
+                .or_else(|| parent.child_by_field_name("property"))
+            {
+                if contains_node(field, identifier) {
+                    let receiver = parent
+                        .child_by_field_name("argument")
+                        .or_else(|| parent.child_by_field_name("object"))
+                        .or_else(|| receiver_from_member_text(parent, identifier, source))?;
+                    let receiver_name = trailing_identifier(text(receiver, source))?;
+                    return Some(MemberAccess {
+                        receiver: receiver_name,
+                    });
+                }
+            }
+        }
+        if !matches!(parent.kind(), "field_identifier" | "property_identifier" | "identifier") {
+            return member_access_from_line(identifier, source);
+        }
+        current = parent;
+    }
+}
+
+fn receiver_from_member_text<'a>(
+    parent: TsNode<'a>,
+    identifier: TsNode<'a>,
+    _source: &'a str,
+) -> Option<TsNode<'a>> {
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        if child.end_byte() <= identifier.start_byte() && !matches!(child.kind(), "." | "->") {
+            return Some(child);
+        }
+    }
+    None
+}
+
+fn member_access_from_line(identifier: TsNode<'_>, source: &str) -> Option<MemberAccess> {
+    let pos = identifier.start_position();
+    let line = source.lines().nth(pos.row)?;
+    let before_field = &line[..pos.column.min(line.len())];
+    let trimmed = before_field.trim_end();
+    let before_receiver = trimmed
+        .strip_suffix("->")
+        .or_else(|| trimmed.strip_suffix('.'))?;
+    let receiver = trailing_identifier(before_receiver)?;
+    Some(MemberAccess { receiver })
+}
+
+fn trailing_identifier(text: &str) -> Option<String> {
+    let mut end = text.len();
+    while end > 0 {
+        let (prev, ch) = text[..end].char_indices().next_back()?;
+        if ch.is_whitespace() || matches!(ch, ')' | ']') {
+            end = prev;
+        } else {
+            break;
+        }
+    }
+    let mut start = end;
+    while start > 0 {
+        let (prev, ch) = text[..start].char_indices().next_back()?;
+        if !is_ident_char(ch) {
+            break;
+        }
+        start = prev;
+    }
+    if start == end {
+        None
+    } else {
+        Some(text[start..end].to_string())
+    }
+}
+
+fn declared_type_for_identifier(identifier: TsNode<'_>, source: &str) -> Option<String> {
+    let mut current = identifier;
+    loop {
+        let parent = current.parent()?;
+        if matches!(
+            parent.kind(),
+            "declaration" | "parameter_declaration" | "field_declaration" | "init_declarator"
+        ) {
+            let decl = if parent.kind() == "init_declarator" {
+                parent.parent().unwrap_or(parent)
+            } else {
+                parent
+            };
+            let decl_text = text(decl, source);
+            let rel_end = identifier.start_byte().saturating_sub(decl.start_byte());
+            return clean_declared_type(&decl_text[..rel_end.min(decl_text.len())]);
+        }
+        if matches!(parent.kind(), "compound_statement" | "translation_unit") {
+            return None;
+        }
+        current = parent;
+    }
+}
+
+fn clean_declared_type(raw: &str) -> Option<String> {
+    let cleaned = raw
+        .replace('*', " ")
+        .replace('&', " ")
+        .replace("const", " ")
+        .replace("volatile", " ")
+        .replace("static", " ")
+        .replace("extern", " ")
+        .replace("register", " ");
+    let words = cleaned
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty())
+        .filter(|word| !matches!(*word, "struct" | "class" | "enum" | "union"))
+        .collect::<Vec<_>>();
+    words.last().map(|word| (*word).to_string())
+}
+
+fn field_matches_type(node: &Node, type_name: &str, field: &str) -> bool {
+    node.qualified_name.ends_with(&format!("#{type_name}::{field}"))
+        || node.qualified_name.ends_with(&format!("::{type_name}::{field}"))
 }
 
 fn identifier_from_node_or_ancestor(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
@@ -975,6 +1293,73 @@ void run(void) {
         assert_eq!(location.range.start.line, 3);
         assert_eq!(location.range.start.character, 8);
         assert_eq!(location.range.end.character, 15);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn definition_resolves_equel_hash_local_declaration() {
+        let dir = temp_project("equel-local-definition");
+        fs::write(
+            dir.join("sample_esql.qsc"),
+            r#"static DU_STATUS
+generic_handler(DU_ERROR *errcb, i4 error)
+##{
+##  char        case_semantics[6];
+    case_semantics[0] = '-';
+##}
+"#,
+        )
+        .unwrap();
+        let mut grph = Grph::init(&dir).unwrap();
+        grph.index(|_| {}).unwrap();
+
+        let handlers = LspHandlers::new(dir.clone()).unwrap();
+        let value = handlers
+            .definition(&json!({
+                "textDocument": {"uri": convert::path_to_uri(&dir, "sample_esql.qsc")},
+                "position": {"line": 4, "character": 5}
+            }))
+            .unwrap();
+        let location: lsp_types::Location = serde_json::from_value(value).unwrap();
+        assert_eq!(location.range.start.line, 3);
+        assert_eq!(location.range.start.character, 16);
+        assert_eq!(location.range.end.character, 30);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+
+    #[test]
+    fn definition_resolves_c_member_field_by_receiver_type() {
+        let dir = temp_project("field-definition");
+        fs::write(
+            dir.join("main.c"),
+            r#"struct Other { int count; };
+struct App { int count; int size; };
+
+void run(struct App *app) {
+    app->size = app->count;
+}
+"#,
+        )
+        .unwrap();
+        let mut grph = Grph::init(&dir).unwrap();
+        grph.index(|_| {}).unwrap();
+
+        let handlers = LspHandlers::new(dir.clone()).unwrap();
+        let value = handlers
+            .definition(&json!({
+                "textDocument": {"uri": convert::path_to_uri(&dir, "main.c")},
+                "position": {"line": 4, "character": 9}
+            }))
+            .unwrap();
+        let location: lsp_types::Location = serde_json::from_value(value).unwrap();
+        assert_eq!(location.range.start.line, 1);
+        assert!(
+            location.range.start.character >= 24,
+            "expected App::size field, got {location:?}"
+        );
 
         fs::remove_dir_all(dir).ok();
     }
