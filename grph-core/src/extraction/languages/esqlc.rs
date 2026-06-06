@@ -43,9 +43,6 @@ pub fn extract(source: &str, file_path: &str) -> Result<ExtractionResult> {
     extract_sql_references(source, file_path, is_quel, &mut result);
     extract_declare_section(source, file_path, &mut result);
     extract_esql_includes(source, file_path, &mut result);
-    if is_quel {
-        extract_equel_struct_fields(source, file_path, &mut result);
-    }
 
     Ok(result)
 }
@@ -60,36 +57,233 @@ fn preprocess_for_c(source: &str, is_quel: bool) -> String {
 
     for line in &lines {
         if is_quel {
-            // EQUEL: `## stmt` → `// stmt` (comment out for tree-sitter C)
-            if line.trim_start().starts_with("##") {
-                out.push(line.replacen("##", "//", 1));
-                continue;
-            }
-        } else {
-            // ESQL: neutralise `exec sql ...` blocks
-            if in_exec_sql {
-                if line_has_trailing_semicolon(line) {
-                    in_exec_sql = false;
-                }
-                out.push(String::new());
-                continue;
-            }
+            out.push(preprocess_equel_line_for_c(line));
+            continue;
+        }
 
-            if line_starts_exec_sql(line) {
-                if line_has_trailing_semicolon(line) {
-                    out.push(String::new());
-                } else {
-                    in_exec_sql = true;
-                    out.push(String::new());
-                }
-                continue;
+        // ESQL: neutralise `exec sql ...` blocks
+        if in_exec_sql {
+            if line_has_trailing_semicolon(line) {
+                in_exec_sql = false;
             }
+            out.push(String::new());
+            continue;
+        }
+
+        if line_starts_exec_sql(line) {
+            if line_has_trailing_semicolon(line) {
+                out.push(String::new());
+            } else {
+                in_exec_sql = true;
+                out.push(String::new());
+            }
+            continue;
         }
 
         out.push((*line).to_string());
     }
 
     out.join("\n")
+}
+
+/// Convert one EQUEL line into C-compatible text while preserving line numbers.
+///
+/// The embedded grammars distinguish host-language C fragments from EQUEL
+/// commands. Mirror that shape here: pass through host declarations, braces,
+/// comments, and include directives; comment out database commands so
+/// tree-sitter can parse the surrounding C normally.
+fn preprocess_equel_line_for_c(line: &str) -> String {
+    let Some(marker) = line.find("##") else {
+        return line.to_string();
+    };
+
+    let (prefix, after_marker) = line.split_at(marker);
+    let body = &after_marker[2..];
+    let trimmed = body.trim_start();
+
+    if trimmed.is_empty() {
+        return replace_equel_marker_with_spaces(line, marker);
+    }
+
+    if trimmed.starts_with("include") {
+        return format!("{prefix}#{}", body.trim_start());
+    }
+
+    if is_equel_host_c_fragment(trimmed) {
+        return replace_equel_marker_with_spaces_and_normalized_body(
+            line,
+            marker,
+            normalize_equel_host_c_fragment(body),
+        );
+    }
+
+    replace_equel_marker_with_comment(line, marker)
+}
+
+fn replace_equel_marker_with_spaces_and_normalized_body(
+    line: &str,
+    marker: usize,
+    body: String,
+) -> String {
+    let mut out = String::with_capacity(line.len().max(marker + 2 + body.len()));
+    out.push_str(&line[..marker]);
+    out.push_str("  ");
+    out.push_str(&body);
+    out
+}
+
+fn normalize_equel_host_c_fragment(body: &str) -> String {
+    let leading = body.len() - body.trim_start().len();
+    let trimmed = &body[leading..];
+    if let Some(rest) = trimmed.strip_prefix("typedef struct") {
+        let rest_trimmed = rest.trim_start();
+        if rest_trimmed.starts_with('_')
+            || rest_trimmed
+                .chars()
+                .next()
+                .map_or(false, |ch| ch.is_ascii_alphabetic())
+        {
+            let after_tag = rest_trimmed
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .map(|idx| &rest_trimmed[idx..])
+                .unwrap_or("");
+            return format!("{}typedef struct{}", &body[..leading], after_tag);
+        }
+    }
+    body.to_string()
+}
+
+fn replace_equel_marker_with_spaces(line: &str, marker: usize) -> String {
+    let mut out = String::with_capacity(line.len());
+    out.push_str(&line[..marker]);
+    out.push_str("  ");
+    out.push_str(&line[marker + 2..]);
+    out
+}
+
+fn replace_equel_marker_with_comment(line: &str, marker: usize) -> String {
+    let mut out = String::with_capacity(line.len());
+    out.push_str(&line[..marker]);
+    out.push_str("//");
+    out.push_str(&line[marker + 2..]);
+    out
+}
+
+fn is_equel_host_c_fragment(trimmed: &str) -> bool {
+    if matches!(trimmed, "{" | "}" | ";")
+        || trimmed.starts_with('}')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("*/")
+        || trimmed.starts_with('#')
+    {
+        return true;
+    }
+
+    let head = first_word(trimmed).unwrap_or("");
+    if head.is_empty() || is_equel_command_word(head) {
+        return false;
+    }
+
+    trimmed.starts_with("typedef struct")
+        || trimmed.starts_with("typedef enum")
+        || trimmed.starts_with("typedef union")
+        || trimmed.starts_with("struct ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("union ")
+        || (trimmed.contains(';')
+            && (is_c_type_intro(head)
+                || trimmed.contains("typedef")
+                || trimmed.contains("struct")
+                || trimmed.contains("enum")
+                || trimmed.contains("union")))
+}
+
+fn first_word(text: &str) -> Option<&str> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .find(|word| !word.is_empty())
+}
+
+fn is_c_type_intro(word: &str) -> bool {
+    matches!(
+        word,
+        "auto"
+            | "bool"
+            | "char"
+            | "const"
+            | "double"
+            | "enum"
+            | "extern"
+            | "float"
+            | "GLOBALDEF"
+            | "GLOBALREF"
+            | "i1"
+            | "i2"
+            | "i4"
+            | "i8"
+            | "int"
+            | "long"
+            | "nat"
+            | "PTR"
+            | "register"
+            | "short"
+            | "signed"
+            | "static"
+            | "struct"
+            | "typedef"
+            | "u_i1"
+            | "u_i2"
+            | "u_i4"
+            | "u_i8"
+            | "union"
+            | "unsigned"
+            | "VOID"
+            | "void"
+    ) || word.chars().next().map_or(false, char::is_uppercase)
+}
+
+fn is_equel_command_word(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "append"
+            | "call"
+            | "clear"
+            | "close"
+            | "commit"
+            | "copy"
+            | "delete"
+            | "display"
+            | "enddata"
+            | "endforms"
+            | "fetch"
+            | "finalize"
+            | "flush"
+            | "getform"
+            | "getoper"
+            | "help"
+            | "include"
+            | "ingres"
+            | "inquire_equel"
+            | "message"
+            | "modify"
+            | "open"
+            | "prepare"
+            | "print"
+            | "prompt"
+            | "putform"
+            | "range"
+            | "redisplay"
+            | "repeat"
+            | "replace"
+            | "retrieve"
+            | "rollback"
+            | "run"
+            | "save"
+            | "set"
+            | "sleep"
+            | "unloadtable"
+            | "validate"
+    )
 }
 
 fn line_starts_exec_sql(line: &str) -> bool {
@@ -695,201 +889,6 @@ fn extract_esql_includes(source: &str, _file_path: &str, result: &mut Extraction
                 provenance: Some("esqlc-overlay".to_string()),
             });
         }
-    }
-}
-
-/// Extract EQUEL/QSH typedef-struct fields from `##` lines.
-///
-/// The C parser sees EQUEL `##` lines as comments, so generated/header-style
-/// declarations such as `## char field[32];` inside `## typedef struct ...`
-/// would otherwise be invisible to the graph, ctags, and LSP member lookup.
-fn extract_equel_struct_fields(source: &str, file_path: &str, result: &mut ExtractionResult) {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut i = 0usize;
-
-    while i < lines.len() {
-        let normalized = equel_c_line(lines[i]);
-        if !normalized.contains("typedef struct") && !normalized.starts_with("struct ") {
-            i += 1;
-            continue;
-        }
-
-        let start_line = (i + 1) as u32;
-        let struct_tag = struct_tag_name(normalized);
-        let mut end = i;
-        let mut alias = None;
-        let mut saw_open_brace = normalized.contains('{');
-
-        while end + 1 < lines.len() {
-            end += 1;
-            let line = equel_c_line(lines[end]);
-            let code_owned = strip_c_line_noise(line);
-            let code = code_owned.trim();
-            if code.contains('{') {
-                saw_open_brace = true;
-            }
-            if saw_open_brace && code.contains('}') {
-                alias = typedef_struct_alias(code).or_else(|| struct_tag.clone());
-                break;
-            }
-        }
-
-        let Some(type_name) = alias.or(struct_tag) else {
-            i += 1;
-            continue;
-        };
-        let end_line = (end + 1) as u32;
-        let struct_id = crate::extraction::tree_sitter::generate_node_id(
-            file_path,
-            NodeKind::Struct.as_str(),
-            &type_name,
-            start_line,
-        );
-
-        if !result.nodes.iter().any(|node| {
-            node.kind == NodeKind::Struct && node.name == type_name && node.start_line == start_line
-        }) {
-            result.nodes.push(Node {
-                id: struct_id.clone(),
-                kind: NodeKind::Struct,
-                name: type_name.clone(),
-                qualified_name: crate::extraction::tree_sitter::build_qualified_name(
-                    file_path, &type_name,
-                ),
-                file_path: file_path.to_string(),
-                language: Language::Esqlc,
-                start_line,
-                end_line,
-                start_column: 0,
-                end_column: lines[end].len() as u32,
-                docstring: None,
-                signature: Some(normalized.trim().to_string()),
-                visibility: None,
-                is_exported: false,
-                is_async: false,
-                is_static: false,
-                is_abstract: false,
-                decorators: None,
-                type_parameters: None,
-                updated_at: crate::extraction::tree_sitter::now_ms(),
-            });
-        }
-
-        for row in (i + 1)..end {
-            let line = lines[row];
-            let normalized = equel_c_line(line);
-            let Some(field_name) = equel_field_name(normalized) else {
-                continue;
-            };
-            let line_num = (row + 1) as u32;
-            if result.nodes.iter().any(|node| {
-                node.kind == NodeKind::Field
-                    && node.name == field_name
-                    && node.file_path == file_path
-                    && node.start_line == line_num
-            }) {
-                continue;
-            }
-            let start_col = line.find(&field_name).unwrap_or(0) as u32;
-            let field_id = crate::extraction::tree_sitter::generate_node_id(
-                file_path,
-                NodeKind::Field.as_str(),
-                &field_name,
-                line_num,
-            );
-            result.nodes.push(Node {
-                id: field_id.clone(),
-                kind: NodeKind::Field,
-                name: field_name.clone(),
-                qualified_name: format!(
-                    "{}::{}",
-                    crate::extraction::tree_sitter::build_qualified_name(file_path, &type_name),
-                    field_name
-                ),
-                file_path: file_path.to_string(),
-                language: Language::Esqlc,
-                start_line: line_num,
-                end_line: line_num,
-                start_column: start_col,
-                end_column: start_col + field_name.len() as u32,
-                docstring: None,
-                signature: Some(normalized.trim().to_string()),
-                visibility: None,
-                is_exported: false,
-                is_async: false,
-                is_static: false,
-                is_abstract: false,
-                decorators: None,
-                type_parameters: None,
-                updated_at: crate::extraction::tree_sitter::now_ms(),
-            });
-            result.edges.push(Edge {
-                source: struct_id.clone(),
-                target: field_id,
-                kind: EdgeKind::Contains,
-                metadata: None,
-                line: Some(line_num),
-                col: Some(start_col),
-                provenance: Some("esqlc-overlay".to_string()),
-            });
-        }
-
-        i = end.saturating_add(1);
-    }
-}
-
-fn equel_c_line(line: &str) -> &str {
-    line.trim_start()
-        .strip_prefix("##")
-        .unwrap_or(line)
-        .trim_start()
-}
-
-fn struct_tag_name(line: &str) -> Option<String> {
-    let re = Regex::new(r"\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)").ok()?;
-    let tag = re.captures(line)?.get(1)?.as_str();
-    Some(tag.trim_start_matches('_').to_string()).filter(|name| !name.is_empty())
-}
-
-fn typedef_struct_alias(line: &str) -> Option<String> {
-    let after = line.split('}').nth(1)?.trim();
-    let re = Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)\b").ok()?;
-    re.captures(after)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().to_string())
-}
-
-fn equel_field_name(line: &str) -> Option<String> {
-    let code = strip_c_line_noise(line);
-    let declaration = code.trim();
-    if declaration.is_empty()
-        || declaration.starts_with('#')
-        || declaration.starts_with('{')
-        || declaration.starts_with('}')
-        || declaration.starts_with("**")
-        || declaration.starts_with("*/")
-        || declaration.starts_with("/*")
-        || declaration.contains("typedef")
-        || declaration.contains('(')
-    {
-        return None;
-    }
-
-    let before_semicolon = declaration.trim_end_matches(';').trim();
-    let before_array = before_semicolon
-        .split('[')
-        .next()
-        .unwrap_or(before_semicolon)
-        .trim_end();
-    let re = Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*$").ok()?;
-    let name = re.captures(before_array)?.get(1)?.as_str();
-    if matches!(
-        name,
-        "char" | "int" | "i1" | "i2" | "i4" | "bool" | "struct" | "enum"
-    ) {
-        None
-    } else {
-        Some(name.to_string())
     }
 }
 
