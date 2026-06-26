@@ -56,11 +56,7 @@ impl LspSession {
         let is_notification = id.is_none();
 
         if method == "initialize" {
-            let root = params
-                .get("rootUri")
-                .and_then(Value::as_str)
-                .and_then(root_uri_to_path)
-                .unwrap_or_else(|| self.root.clone());
+            let root = project_root_from_initialize(params, &self.root);
             match LspHandlers::new(root) {
                 Ok(handlers) => {
                     let result = handlers.initialize_result();
@@ -185,6 +181,61 @@ fn jsonrpc_error(id: Option<Value>, code: i64, message: impl Into<String>) -> Va
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
 }
 
+fn project_root_from_initialize(params: &Value, launch_root: &std::path::Path) -> PathBuf {
+    // Editors often initialize an LSP with the workspace root, while grph may be
+    // launched from (or pointed at) a nested indexed project. Prefer any path
+    // that actually contains a .grph database so relative file paths/URIs match
+    // the index. This prevents a workspace like /repo from overriding an index
+    // rooted at /repo/src.
+    let mut candidates = Vec::new();
+
+    if let Some(path) = params
+        .get("rootUri")
+        .and_then(Value::as_str)
+        .and_then(root_uri_to_path)
+    {
+        candidates.push(path);
+    }
+
+    if let Some(folders) = params.get("workspaceFolders").and_then(Value::as_array) {
+        for folder in folders {
+            if let Some(path) = folder
+                .get("uri")
+                .and_then(Value::as_str)
+                .and_then(root_uri_to_path)
+            {
+                candidates.push(path);
+            }
+        }
+    }
+
+    candidates.push(launch_root.to_path_buf());
+
+    for candidate in &candidates {
+        if grph_db_exists(candidate) {
+            return candidate.clone();
+        }
+    }
+
+    for candidate in &candidates {
+        if let Some(root) = nearest_grph_root(candidate) {
+            return root;
+        }
+    }
+
+    launch_root.to_path_buf()
+}
+
+fn grph_db_exists(path: &std::path::Path) -> bool {
+    path.join(".grph").join("grph.db").is_file()
+}
+
+fn nearest_grph_root(path: &std::path::Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|candidate| grph_db_exists(candidate))
+        .map(PathBuf::from)
+}
+
 fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
     let raw = uri.strip_prefix("file://")?;
     let decoded = urlencoding::decode(raw).ok()?.to_string();
@@ -200,5 +251,56 @@ fn drain<R: Read>(reader: &mut R, len: usize) {
             Ok(0) | Err(_) => break,
             Ok(n) => remaining -= n,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "grph-lsp-transport-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn initialize_prefers_launch_root_when_it_has_grph_db() {
+        let workspace = temp_dir("workspace-root");
+        let project = workspace.join("src");
+        fs::create_dir_all(project.join(".grph")).unwrap();
+        fs::write(project.join(".grph/grph.db"), b"").unwrap();
+
+        let params = json!({"rootUri": format!("file://{}", workspace.display())});
+        let root = project_root_from_initialize(&params, &project);
+        assert_eq!(root, project);
+
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn initialize_uses_workspace_folder_that_has_grph_db() {
+        let workspace = temp_dir("workspace-folder");
+        let project = workspace.join("src");
+        fs::create_dir_all(project.join(".grph")).unwrap();
+        fs::write(project.join(".grph/grph.db"), b"").unwrap();
+
+        let params = json!({
+            "rootUri": format!("file://{}", workspace.display()),
+            "workspaceFolders": [{"uri": format!("file://{}", project.display()), "name": "src"}]
+        });
+        let root = project_root_from_initialize(&params, &workspace);
+        assert_eq!(root, project);
+
+        fs::remove_dir_all(workspace).ok();
     }
 }
