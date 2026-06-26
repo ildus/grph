@@ -123,7 +123,13 @@ impl ContextBuilder {
         if let Ok(file_count) = self.db.count_files() {
             opts.apply_project_size(file_count);
         }
-        let context = self.build_task_context(task_description, &opts)?;
+        let normalized_query = normalize_context_query(task_description);
+        let query = if normalized_query.is_empty() {
+            task_description.trim()
+        } else {
+            normalized_query.as_str()
+        };
+        let context = self.build_task_context(query, &opts)?;
 
         if context.nodes.is_empty() {
             return Ok("No relevant symbols found.".to_string());
@@ -1172,6 +1178,28 @@ fn is_generic_utility_symbol(node: &Node) -> bool {
     is_builtin(&node.name, node.language)
 }
 
+fn normalize_context_query(query: &str) -> String {
+    // MCP clients and LLM planners sometimes pass an action phrase as part of
+    // the task argument, e.g. "Get ranked context for payment retry review". Those
+    // wrapper words are tool intent, not repository vocabulary, and they pollute
+    // lexical retrieval.  Strip only known retrieval phrases; keep the domain
+    // user/topic words that follow ("payment retry" in the example).
+    let mut cleaned = query.trim().to_string();
+    let phrase_patterns = [
+        r"(?i)\bexecute\s+\d+\s+tool\s+calls?\b",
+        r"(?i)\b(?:get|find|fetch|retrieve|build|generate|provide|return|show)\s+(?:the\s+)?(?:ranked\s+)?(?:code\s+)?context\s+(?:for|about|on|of|related\s+to)\b",
+        r"(?i)\b(?:get|find|fetch|retrieve|build|generate|provide|return|show)\s+(?:the\s+)?(?:ranked\s+)?(?:code\s+)?context\b",
+        r"(?i)\b(?:ranked\s+)?(?:code\s+)?context\s+(?:for|about|on|of|related\s+to)\b",
+    ];
+
+    for pattern in phrase_patterns {
+        let re = regex::Regex::new(pattern).unwrap();
+        cleaned = re.replace_all(&cleaned, " ").into_owned();
+    }
+
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn extract_symbols_from_query(query: &str) -> Vec<String> {
     let mut symbols = HashSet::new();
     let re =
@@ -1630,8 +1658,14 @@ fn common_word(word: &str) -> bool {
             | "work"
             | "works"
             | "find"
+            | "fetch"
+            | "retrieve"
+            | "retrieves"
+            | "retrieved"
+            | "retrieving"
             | "found"
             | "show"
+            | "ranked"
             | "call"
             | "called"
             | "calling"
@@ -2252,4 +2286,34 @@ fn indentation(line: &str) -> usize {
 
 fn format_file_and_line(file_path: &str, line: u32) -> String {
     format!("{}:{}", file_path, line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_context_tool_wrapper_phrases() {
+        assert_eq!(
+            normalize_context_query("Get ranked context for payment retry review"),
+            "payment retry review"
+        );
+        assert_eq!(
+            normalize_context_query("execute 1 tool call Get ranked context for payment retry"),
+            "payment retry"
+        );
+        assert_eq!(
+            normalize_context_query("context for auth middleware"),
+            "auth middleware"
+        );
+    }
+
+    #[test]
+    fn search_terms_ignore_residual_retrieval_words() {
+        let terms = extract_search_terms("retrieve ranked context payment retry");
+        assert!(terms.contains(&"payment".to_string()));
+        assert!(terms.contains(&"retry".to_string()));
+        assert!(!terms.contains(&"retrieve".to_string()));
+        assert!(!terms.contains(&"ranked".to_string()));
+    }
 }
