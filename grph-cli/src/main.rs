@@ -318,9 +318,17 @@ fn main() -> grph_core::Result<()> {
                     } else {
                         path.join(file)
                     };
-                    grph.resolve_pending_refs_for_file(&file, resolve_limit)?
+                    grph.resolve_pending_refs_for_file_with_progress(
+                        &file,
+                        resolve_limit,
+                        |progress| {
+                            print_resolution_progress(&progress);
+                        },
+                    )?
                 } else {
-                    grph.resolve_pending_refs(resolve_limit)?
+                    grph.resolve_pending_refs_with_progress(resolve_limit, |progress| {
+                        print_resolution_progress(&progress);
+                    })?
                 };
                 print_resolution_result("pending", &resolved);
             } else {
@@ -331,9 +339,20 @@ fn main() -> grph_core::Result<()> {
                     } else {
                         path.join(file)
                     };
-                    grph.sync_file(&file)?
+                    eprintln!("Syncing {}...", file.display());
+                    grph.sync_file_with_progress(&file, |progress| {
+                        print_resolution_progress(&progress);
+                    })?
                 } else {
-                    grph.sync()?
+                    eprintln!("Syncing...");
+                    grph.sync_with_progress(
+                        |progress| {
+                            print_sync_progress(&progress);
+                        },
+                        |progress| {
+                            print_resolution_progress(&progress);
+                        },
+                    )?
                 };
                 println!(
                     "Synced: {} changed, {} added, {} deleted",
@@ -610,9 +629,52 @@ fn print_index_progress(progress: &grph_core::extraction::IndexProgress) {
     let _ = io::stderr().flush();
 }
 
+fn print_sync_progress(progress: &grph_core::extraction::SyncProgress) {
+    if progress.phase == "complete" {
+        eprintln!();
+        return;
+    }
+    use std::io::{self, Write};
+    let _ = write!(
+        io::stderr(),
+        "\r\x1b[K[sync {}/{} | changed {} added {} deleted {}] {}: {}",
+        progress.current,
+        progress.total,
+        progress.files_changed,
+        progress.files_added,
+        progress.files_deleted,
+        progress.phase,
+        progress.current_file.as_deref().unwrap_or("")
+    );
+    let _ = io::stderr().flush();
+}
+
+fn print_resolution_progress(progress: &grph_core::types::ResolutionProgress) {
+    if progress.phase == "complete" {
+        eprintln!();
+        return;
+    }
+    use std::io::{self, Write};
+
+    // Reference names can be noisy parser artifacts (string fragments,
+    // punctuation, shell tokens). Keep progress stable and human-readable by
+    // showing only the file currently being resolved.
+    let current_file = progress.current_file.as_deref().unwrap_or("");
+    let _ = write!(
+        io::stderr(),
+        "\r\x1b[K[resolve {}/{} groups | resolved {} unresolved {}] {}",
+        progress.current,
+        progress.total,
+        progress.resolved_groups,
+        progress.unresolved_groups,
+        current_file
+    );
+    let _ = io::stderr().flush();
+}
+
 fn print_resolution_result(label: &str, result: &grph_core::resolution::ResolutionResult) {
     println!(
-        "Resolved {}/{} {} references across {}/{} groups ({} refs unresolved in batch, {} total remaining)",
+        "Resolved {}/{} {} refs in this batch; groups {}/{} resolved; {} refs unresolved in batch; {} total refs remain unresolved",
         result.resolved,
         result.total,
         label,

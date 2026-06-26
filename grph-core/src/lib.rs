@@ -143,13 +143,22 @@ impl Grph {
 
     /// Sync changed files
     pub fn sync(&mut self) -> Result<extraction::SyncResult> {
+        self.sync_with_progress(|_| {}, |_| {})
+    }
+
+    /// Sync changed files with sync and resolution progress callbacks.
+    pub fn sync_with_progress(
+        &mut self,
+        sync_progress: impl Fn(extraction::SyncProgress),
+        resolve_progress: impl Fn(types::ResolutionProgress),
+    ) -> Result<extraction::SyncResult> {
         let mut orchestrator =
             ExtractionOrchestrator::new(self.db.clone(), self.project_root.clone())?;
-        let result = orchestrator.sync()?;
+        let result = orchestrator.sync_with_progress(sync_progress)?;
 
         // Run cross-file reference resolution only if files actually changed.
         if result.files_changed > 0 || result.files_added > 0 || result.files_deleted > 0 {
-            self.resolve_cross_file_refs_if_needed();
+            self.resolve_cross_file_refs_if_needed_with_progress(resolve_progress);
         }
 
         Ok(result)
@@ -157,6 +166,15 @@ impl Grph {
 
     /// Sync one file and resolve only references emitted by that file.
     pub fn sync_file(&mut self, file_path: &std::path::Path) -> Result<extraction::SyncResult> {
+        self.sync_file_with_progress(file_path, |_| {})
+    }
+
+    /// Sync one file with resolution progress.
+    pub fn sync_file_with_progress(
+        &mut self,
+        file_path: &std::path::Path,
+        resolve_progress: impl Fn(types::ResolutionProgress),
+    ) -> Result<extraction::SyncResult> {
         let mut orchestrator =
             ExtractionOrchestrator::new(self.db.clone(), self.project_root.clone())?;
         let result = orchestrator.sync_file(file_path)?;
@@ -173,7 +191,11 @@ impl Grph {
             };
             let mut resolver =
                 resolution::ReferenceResolver::new(self.db.clone(), self.project_root.clone());
-            let resolved = resolver.resolve_file(&relative_path)?;
+            let resolved = resolver.resolve_file_with_limit_progress(
+                &relative_path,
+                100_000,
+                resolve_progress,
+            )?;
             if resolved.resolved > 0 || resolved.unresolved > 0 {
                 eprintln!(
                     "Resolved {}/{} file references across {}/{} groups ({} refs unresolved in batch, {} total remaining)",
@@ -192,6 +214,13 @@ impl Grph {
 
     /// Resolve cross-file references — only prints if there's work to do.
     fn resolve_cross_file_refs_if_needed(&self) {
+        self.resolve_cross_file_refs_if_needed_with_progress(|_| {})
+    }
+
+    fn resolve_cross_file_refs_if_needed_with_progress(
+        &self,
+        progress: impl Fn(types::ResolutionProgress),
+    ) {
         let unresolved_count = match self.db.count_pending_unresolved_refs() {
             Ok(c) => c,
             Err(e) => {
@@ -202,7 +231,7 @@ impl Grph {
         if unresolved_count == 0 {
             return;
         }
-        match self.resolve_pending_refs(100_000) {
+        match self.resolve_pending_refs_with_progress(100_000, progress) {
             Ok(result) => print_resolution_result("cross-file", &result),
             Err(e) => eprintln!("WARN: Cross-file reference resolution failed: {}", e),
         }
@@ -210,9 +239,17 @@ impl Grph {
 
     /// Resolve pending cross-file references without re-indexing.
     pub fn resolve_pending_refs(&self, group_limit: u32) -> Result<resolution::ResolutionResult> {
+        self.resolve_pending_refs_with_progress(group_limit, |_| {})
+    }
+
+    pub fn resolve_pending_refs_with_progress(
+        &self,
+        group_limit: u32,
+        progress: impl Fn(types::ResolutionProgress),
+    ) -> Result<resolution::ResolutionResult> {
         let mut resolver =
             resolution::ReferenceResolver::new(self.db.clone(), self.project_root.clone());
-        resolver.resolve_all_with_limit(group_limit)
+        resolver.resolve_all_with_limit_progress(group_limit, progress)
     }
 
     /// Resolve pending references for one file without re-indexing it.
@@ -220,6 +257,15 @@ impl Grph {
         &self,
         file_path: &std::path::Path,
         group_limit: u32,
+    ) -> Result<resolution::ResolutionResult> {
+        self.resolve_pending_refs_for_file_with_progress(file_path, group_limit, |_| {})
+    }
+
+    pub fn resolve_pending_refs_for_file_with_progress(
+        &self,
+        file_path: &std::path::Path,
+        group_limit: u32,
+        progress: impl Fn(types::ResolutionProgress),
     ) -> Result<resolution::ResolutionResult> {
         let relative_path = if file_path.is_absolute() {
             file_path
@@ -232,7 +278,7 @@ impl Grph {
         };
         let mut resolver =
             resolution::ReferenceResolver::new(self.db.clone(), self.project_root.clone());
-        resolver.resolve_file_with_limit(&relative_path, group_limit)
+        resolver.resolve_file_with_limit_progress(&relative_path, group_limit, progress)
     }
 
     /// Build context for an AI task

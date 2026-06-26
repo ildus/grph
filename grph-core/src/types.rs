@@ -264,6 +264,30 @@ pub struct SyncResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncProgress {
+    pub current: u64,
+    pub total: u64,
+    pub phase: String,
+    pub current_file: Option<String>,
+    pub files_changed: u64,
+    pub files_added: u64,
+    pub files_deleted: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolutionProgress {
+    pub current: u64,
+    pub total: u64,
+    pub phase: String,
+    pub current_name: Option<String>,
+    pub current_file: Option<String>,
+    pub resolved: u64,
+    pub unresolved: u64,
+    pub resolved_groups: u64,
+    pub unresolved_groups: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnresolvedRef {
     pub id: Option<i64>,
     pub from_node_id: String,

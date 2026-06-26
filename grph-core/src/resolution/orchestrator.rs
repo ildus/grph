@@ -3,7 +3,7 @@ use crate::db::Database;
 use crate::errors::Result;
 use crate::resolution::builtins::is_builtin;
 use crate::resolution::import_resolver::resolve_import;
-use crate::types::{Language, Node, NodeKind, UnresolvedRefGroup};
+use crate::types::{Language, Node, NodeKind, ResolutionProgress, UnresolvedRefGroup};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -46,8 +46,16 @@ impl ReferenceResolver {
     /// (name, kind, file, language), so this is much cheaper than row-by-row
     /// resolution on macro-heavy C/C++ projects.
     pub fn resolve_all_with_limit(&mut self, limit: u32) -> Result<ResolutionResult> {
+        self.resolve_all_with_limit_progress(limit, |_| {})
+    }
+
+    pub fn resolve_all_with_limit_progress(
+        &mut self,
+        limit: u32,
+        progress: impl Fn(ResolutionProgress),
+    ) -> Result<ResolutionResult> {
         let groups = self.db.get_unresolved_ref_groups(limit)?;
-        self.resolve_groups(&groups)
+        self.resolve_groups_with_progress(&groups, progress)
     }
 
     /// Resolve unresolved references emitted by a single file re-index.
@@ -61,13 +69,26 @@ impl ReferenceResolver {
         file_path: &str,
         limit: u32,
     ) -> Result<ResolutionResult> {
+        self.resolve_file_with_limit_progress(file_path, limit, |_| {})
+    }
+
+    pub fn resolve_file_with_limit_progress(
+        &mut self,
+        file_path: &str,
+        limit: u32,
+        progress: impl Fn(ResolutionProgress),
+    ) -> Result<ResolutionResult> {
         let groups = self
             .db
             .get_unresolved_ref_groups_for_file(file_path, limit)?;
-        self.resolve_groups(&groups)
+        self.resolve_groups_with_progress(&groups, progress)
     }
 
-    fn resolve_groups(&mut self, groups: &[UnresolvedRefGroup]) -> Result<ResolutionResult> {
+    fn resolve_groups_with_progress(
+        &mut self,
+        groups: &[UnresolvedRefGroup],
+        progress: impl Fn(ResolutionProgress),
+    ) -> Result<ResolutionResult> {
         let total_groups = groups.len() as u64;
         let total_refs: u64 = groups.iter().map(|g| g.count).sum();
         let mut resolved = 0u64;
@@ -77,7 +98,30 @@ impl ReferenceResolver {
 
         self.db.conn().execute_batch("PRAGMA foreign_keys = OFF")?;
 
-        for group in groups {
+        progress(ResolutionProgress {
+            current: 0,
+            total: total_groups,
+            phase: "resolve".to_string(),
+            current_name: None,
+            current_file: None,
+            resolved,
+            unresolved,
+            resolved_groups,
+            unresolved_groups,
+        });
+
+        for (idx, group) in groups.iter().enumerate() {
+            progress(ResolutionProgress {
+                current: idx as u64 + 1,
+                total: total_groups,
+                phase: "resolve".to_string(),
+                current_name: Some(group.reference_name.clone()),
+                current_file: Some(group.file_path.clone()),
+                resolved,
+                unresolved,
+                resolved_groups,
+                unresolved_groups,
+            });
             let language = Language::from_str(&group.language).unwrap_or(Language::Python);
             let name = &group.reference_name;
 
@@ -124,6 +168,18 @@ impl ReferenceResolver {
         }
 
         self.db.conn().execute_batch("PRAGMA foreign_keys = ON")?;
+
+        progress(ResolutionProgress {
+            current: total_groups,
+            total: total_groups,
+            phase: "complete".to_string(),
+            current_name: None,
+            current_file: None,
+            resolved,
+            unresolved,
+            resolved_groups,
+            unresolved_groups,
+        });
 
         Ok(ResolutionResult {
             resolved,

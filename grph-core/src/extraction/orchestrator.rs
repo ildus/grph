@@ -5,8 +5,8 @@ use crate::extraction::languages::extract_for_language;
 use crate::extraction::tree_sitter::ExtractionResult;
 use crate::resolution::builtins::is_builtin;
 use crate::types::{
-    Edge, EdgeKind, FileRecord, IndexProgress, IndexResult, Language, Node, NodeKind, SyncResult,
-    UnresolvedRef,
+    Edge, EdgeKind, FileRecord, IndexProgress, IndexResult, Language, Node, NodeKind, SyncProgress,
+    SyncResult, UnresolvedRef,
 };
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
@@ -396,6 +396,11 @@ impl ExtractionOrchestrator {
 
     /// Incremental sync: detect changed files, re-index only those
     pub fn sync(&mut self) -> Result<SyncResult> {
+        self.sync_with_progress(|_| {})
+    }
+
+    /// Incremental sync with progress callbacks.
+    pub fn sync_with_progress(&mut self, progress: impl Fn(SyncProgress)) -> Result<SyncResult> {
         let files = self.scan_files()?;
         let mut files_changed = 0u64;
         let mut files_added = 0u64;
@@ -420,8 +425,31 @@ impl ExtractionOrchestrator {
             })
             .collect();
 
+        let total = (existing_files.len() + files.len()) as u64;
+        let mut current = 0u64;
+
+        progress(SyncProgress {
+            current,
+            total,
+            phase: "scan".to_string(),
+            current_file: None,
+            files_changed,
+            files_added,
+            files_deleted,
+        });
+
         // Detect deleted files
         for path in existing_files.iter() {
+            current += 1;
+            progress(SyncProgress {
+                current,
+                total,
+                phase: "check-delete".to_string(),
+                current_file: Some(path.clone()),
+                files_changed,
+                files_added,
+                files_deleted,
+            });
             if !current_files.contains(path) {
                 self.db.delete_file_nodes(path)?;
                 self.db.delete_file(path)?;
@@ -431,11 +459,22 @@ impl ExtractionOrchestrator {
 
         // Process new and changed files only.
         for file_path in &files {
+            current += 1;
             let rel_path = file_path
                 .strip_prefix(&self.project_root)
                 .unwrap_or(file_path)
                 .to_string_lossy()
                 .replace('\\', "/");
+
+            progress(SyncProgress {
+                current,
+                total,
+                phase: "check".to_string(),
+                current_file: Some(rel_path.clone()),
+                files_changed,
+                files_added,
+                files_deleted,
+            });
 
             let file_info = match source_file_info(file_path) {
                 Ok(info) => info,
@@ -480,6 +519,15 @@ impl ExtractionOrchestrator {
             let Some(language) = detect_language_for_content(file_path, &content) else {
                 continue;
             };
+            progress(SyncProgress {
+                current,
+                total,
+                phase: "sync".to_string(),
+                current_file: Some(rel_path.clone()),
+                files_changed,
+                files_added,
+                files_deleted,
+            });
             match self.parse_and_store_content(file_path, &rel_path, language, content) {
                 Ok((nodes, edges)) => {
                     nodes_created += nodes as u64;
@@ -495,6 +543,16 @@ impl ExtractionOrchestrator {
                 }
             }
         }
+
+        progress(SyncProgress {
+            current: total,
+            total,
+            phase: "complete".to_string(),
+            current_file: None,
+            files_changed,
+            files_added,
+            files_deleted,
+        });
 
         Ok(SyncResult {
             files_changed,
