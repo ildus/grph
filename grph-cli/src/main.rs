@@ -375,6 +375,12 @@ fn main() -> grph_core::Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&nodes).map_err(grph_core::GrphError::Json)?
                 );
+            } else if nodes.is_empty() {
+                println!("No symbols found for \"{}\".", query);
+                println!();
+                println!("`grph query` searches symbol names only.");
+                println!("For broader task or code-understanding questions, use:");
+                println!("  grph context \"{}\"", query);
             } else {
                 println!("Search Results for \"{}\":\n", query);
                 for node in &nodes {

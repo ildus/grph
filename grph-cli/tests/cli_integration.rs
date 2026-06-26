@@ -85,6 +85,53 @@ class App:
 }
 
 #[test]
+fn cli_query_no_results_suggests_context() {
+    let dir = temp_project("query-no-results");
+    fs::write(
+        dir.join("main.py"),
+        "def greet(name):
+    return name
+",
+    )
+    .unwrap();
+
+    let grph = env!("CARGO_BIN_EXE_grph");
+    let init = Command::new(grph)
+        .args(["init", "-i"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let query = Command::new(grph)
+        .args(["query", "payment retry"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(query.status.success());
+    let stdout = String::from_utf8_lossy(&query.stdout);
+    assert!(
+        stdout.contains("No symbols found for \"payment retry\"."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("`grph query` searches symbol names only."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("grph context \"payment retry\""),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Search Results for"), "{stdout}");
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn cli_query_prioritizes_source_over_build_artifacts() {
     let dir = temp_project("query-rank");
     fs::create_dir_all(dir.join("src")).unwrap();
