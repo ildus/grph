@@ -7,6 +7,8 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::query_analysis::{AnalyzedQuery, QueryIntent};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Markdown,
@@ -78,6 +80,9 @@ struct CodeBlock {
 #[derive(Debug, Clone)]
 struct TaskContext {
     query: String,
+    intent: QueryIntent,
+    confidence_note: Option<String>,
+    next_reads: Vec<String>,
     entry_points: Vec<ScoredNode>,
     nodes: Vec<ScoredNode>,
     edges: Vec<Edge>,
@@ -146,10 +151,17 @@ impl ContextBuilder {
 
     fn build_task_context(&self, query: &str, opts: &ContextOptions) -> Result<TaskContext> {
         let terms = extract_search_terms(query);
-        let mut entry_points = self.hybrid_search(query, opts)?;
+        let symbols = extract_symbols_from_query(query);
+        let analyzed = AnalyzedQuery::analyze(query, &terms, &symbols);
+        let mut entry_points = self.hybrid_search(query, &analyzed, opts)?;
         if entry_points.is_empty() {
             return Ok(TaskContext {
                 query: query.to_string(),
+                intent: analyzed.intent,
+                confidence_note: analyzed.confidence_note.or_else(|| {
+                    Some("No relevant symbols found — try a symbol name or file:line diagnostic.".into())
+                }),
+                next_reads: Vec::new(),
                 entry_points: Vec::new(),
                 nodes: Vec::new(),
                 edges: Vec::new(),
@@ -161,7 +173,7 @@ impl ContextBuilder {
         }
 
         entry_points.sort_by(|a, b| b.score.total_cmp(&a.score));
-        entry_points = shape_entry_points(entry_points, opts.search_limit, &terms);
+        entry_points = shape_entry_points(entry_points, opts.search_limit, &analyzed.content_terms);
 
         let root_ids: HashSet<String> = entry_points.iter().map(|r| r.node.id.clone()).collect();
         let mut scored: HashMap<String, ScoredNode> = HashMap::new();
@@ -187,6 +199,9 @@ impl ContextBuilder {
                         score += 25.0;
                     }
                     score += kind_weight(node.kind);
+                    score += analyzed.intent_kind_bias(node.kind);
+                    score += analyzed.path_boost(&node.file_path) * 0.25;
+                    score += analyzed.symbol_boost(&node.name, &node.qualified_name) * 0.35;
                     if is_test_file(&node.file_path) && !query_mentions_tests(query) {
                         score *= 0.35;
                     }
@@ -215,8 +230,9 @@ impl ContextBuilder {
         nodes.truncate(opts.max_nodes);
         apply_file_diversity_cap(&mut nodes, &root_ids, opts.max_nodes);
         apply_non_prod_cap(&mut nodes, &root_ids, opts.max_nodes, query);
-        prune_low_information_related_nodes(&mut nodes, &root_ids, &terms);
-        self.add_relationship_context(&mut nodes, &root_ids, &terms, opts.max_nodes)?;
+        prune_low_information_related_nodes(&mut nodes, &root_ids, &analyzed.content_terms);
+        self.add_relationship_context(&mut nodes, &root_ids, &analyzed.content_terms, opts.max_nodes)?;
+        apply_diagnostic_rerank(&mut nodes, &analyzed);
         nodes.sort_by(|a, b| b.score.total_cmp(&a.score));
         nodes.truncate(opts.max_nodes);
 
@@ -232,14 +248,22 @@ impl ContextBuilder {
         }
 
         let code_blocks = if opts.include_code {
-            self.extract_code_blocks(&nodes, &edges, &terms, opts)?
+            self.extract_code_blocks(&nodes, &edges, &analyzed.content_terms, opts)?
         } else {
             Vec::new()
         };
         let call_paths = build_call_paths(&nodes, &edges, &root_ids);
+        let next_reads = build_next_reads(&entry_points, &nodes, &analyzed);
+        let confidence_note = analyzed
+            .confidence_note
+            .clone()
+            .or_else(|| confidence_from_scores(&entry_points, &analyzed));
 
         Ok(TaskContext {
             query: query.to_string(),
+            intent: analyzed.intent,
+            confidence_note,
+            next_reads,
             entry_points,
             nodes,
             edges,
@@ -250,9 +274,26 @@ impl ContextBuilder {
         })
     }
 
-    fn hybrid_search(&self, query: &str, opts: &ContextOptions) -> Result<Vec<ScoredNode>> {
-        let symbols = extract_symbols_from_query(query);
-        let terms = extract_search_terms(query);
+    fn hybrid_search(
+        &self,
+        query: &str,
+        analyzed: &AnalyzedQuery,
+        opts: &ContextOptions,
+    ) -> Result<Vec<ScoredNode>> {
+        let symbols = {
+            let mut symbols = extract_symbols_from_query(query);
+            for sym in &analyzed.focus_symbols {
+                if !symbols.iter().any(|s| s.eq_ignore_ascii_case(sym)) {
+                    symbols.push(sym.clone());
+                }
+            }
+            symbols
+        };
+        let terms = if analyzed.content_terms.is_empty() {
+            extract_search_terms(query)
+        } else {
+            analyzed.content_terms.clone()
+        };
         let mut results: HashMap<String, ScoredNode> = HashMap::new();
         let mut exact_ids: HashSet<String> = HashSet::new();
 
@@ -260,8 +301,13 @@ impl ContextBuilder {
         for symbol in &symbols {
             if let Some(node) = self.db.get_node_by_name_any(symbol)? {
                 exact_ids.insert(node.id.clone());
-                let score =
-                    120.0 + kind_weight(node.kind) + path_relevance(&node.file_path, &terms);
+                let score = 120.0
+                    + kind_weight(node.kind)
+                    + path_relevance(&node.file_path, &terms)
+                    + analyzed.path_boost(&node.file_path)
+                    + analyzed.line_boost(&node.file_path, node.start_line, node.end_line)
+                    + analyzed.symbol_boost(&node.name, &node.qualified_name)
+                    + analyzed.intent_kind_bias(node.kind);
                 upsert_scored(
                     &mut results,
                     ScoredNode {
@@ -297,8 +343,13 @@ impl ContextBuilder {
                 if !high_value_kind(node.kind) {
                     continue;
                 }
-                let mut score =
-                    55.0 + lexical_score(&node, term) + path_relevance(&node.file_path, &terms);
+                let mut score = 55.0
+                    + lexical_score(&node, term)
+                    + path_relevance(&node.file_path, &terms)
+                    + analyzed.path_boost(&node.file_path)
+                    + analyzed.line_boost(&node.file_path, node.start_line, node.end_line)
+                    + analyzed.symbol_boost(&node.name, &node.qualified_name)
+                    + analyzed.intent_kind_bias(node.kind);
                 if is_test_file(&node.file_path) && !query_mentions_tests(query) {
                     score *= 0.35;
                 }
@@ -333,7 +384,8 @@ impl ContextBuilder {
                     + kind_weight(node.kind)
                     + (10.0 - ((node.name.len().saturating_sub(title.len())) as f64 / 3.0))
                         .max(0.0)
-                    + path_relevance(&node.file_path, &terms);
+                    + path_relevance(&node.file_path, &terms)
+                    + analyzed.path_boost(&node.file_path);
                 upsert_scored(
                     &mut results,
                     ScoredNode {
@@ -353,13 +405,16 @@ impl ContextBuilder {
         // comments, config keys, or literal text that never appears in symbol names.
         // Scan indexed files and promote symbols from files whose source contains
         // multiple query terms, mirroring codegraph's broader retrieval behavior.
-        for candidate in self.content_search(query, &terms, opts)? {
+        // Prefer analyzed.content_terms so generic type tokens (char/void/...) from
+        // compiler diagnostics do not flood unrelated hits.
+        for candidate in self.content_search(query, &terms, analyzed, opts)? {
             upsert_scored(&mut results, candidate);
         }
 
         let mut values: Vec<ScoredNode> = results.into_values().collect();
         apply_colocation_boost(&mut values, &symbols);
         apply_multi_term_boost(&mut values, &terms, &exact_ids);
+        apply_diagnostic_rerank(&mut values, analyzed);
         values.sort_by(|a, b| b.score.total_cmp(&a.score));
         values.truncate(opts.max_nodes.max(opts.search_limit));
         Ok(values)
@@ -438,6 +493,7 @@ impl ContextBuilder {
         &self,
         query: &str,
         terms: &[String],
+        analyzed: &AnalyzedQuery,
         opts: &ContextOptions,
     ) -> Result<Vec<ScoredNode>> {
         if terms.is_empty() {
@@ -455,10 +511,10 @@ impl ContextBuilder {
             };
             let (matched_terms, matched_lines, proximity_score) =
                 content_proximity_hits(&content, terms);
-            if matched_terms.is_empty() {
+            if matched_terms.is_empty() || analyzed.is_generic_only_match(&matched_terms) {
                 continue;
             }
-            let path_score = path_relevance(&path, terms);
+            let path_score = path_relevance(&path, terms) + analyzed.path_boost(&path);
             let term_score = (matched_terms.len() as f64) * 22.0;
             file_hits.push((
                 path,
@@ -472,14 +528,14 @@ impl ContextBuilder {
         // populated. This keeps old projects useful until the next sync/index.
         if file_hits.is_empty() {
             for file in self.db.list_files(None)? {
-                let path_score = path_relevance(&file.path, terms);
+                let path_score = path_relevance(&file.path, terms) + analyzed.path_boost(&file.path);
                 let path = self.resolve_source_path(&file.path);
                 let Ok(content) = std::fs::read_to_string(path) else {
                     continue;
                 };
                 let (matched_terms, matched_lines, proximity_score) =
                     content_proximity_hits(&content, terms);
-                if matched_terms.is_empty() {
+                if matched_terms.is_empty() || analyzed.is_generic_only_match(&matched_terms) {
                     continue;
                 }
                 let score = path_score + (matched_terms.len() as f64 * 20.0) + proximity_score;
@@ -515,6 +571,9 @@ impl ContextBuilder {
                         + file_score
                         + kind_weight(node.kind)
                         + implementation_kind_bias(node.kind)
+                        + analyzed.intent_kind_bias(node.kind)
+                        + analyzed.line_boost(&node.file_path, node.start_line, node.end_line)
+                        + analyzed.symbol_boost(&node.name, &node.qualified_name)
                         + (node_hits as f64 * 18.0)
                         + proximity;
                     if is_test_file(&node.file_path) && !query_mentions_tests(query) {
@@ -752,7 +811,8 @@ impl ContextBuilder {
         md.push_str("## Code Context\n\n");
         md.push_str(&format!("**Query:** {}\n\n", context.query));
         md.push_str(&format!(
-            "**Summary:** {} entry points, {} related symbols, {} edges, {} files{}\n\n",
+            "**Intent:** `{}` · **Summary:** {} entry points, {} related symbols, {} edges, {} files{}\n\n",
+            context.intent.as_str(),
             context.entry_points.len(),
             context
                 .nodes
@@ -766,6 +826,18 @@ impl ContextBuilder {
                 ""
             }
         ));
+        if let Some(note) = &context.confidence_note {
+            md.push_str(&format!("**Confidence:** {}\n\n", note));
+        }
+
+        if !context.next_reads.is_empty() {
+            md.push_str("### Next reads\n\n");
+            md.push_str("Open these first (highest-precision shortlist):\n\n");
+            for (i, item) in context.next_reads.iter().enumerate() {
+                md.push_str(&format!("{}. {}\n", i + 1, item));
+            }
+            md.push('\n');
+        }
 
         md.push_str("### Entry Points\n\n");
         for entry in &context.entry_points {
@@ -908,6 +980,9 @@ impl ContextBuilder {
             .collect::<Vec<_>>();
         Ok(serde_json::to_string_pretty(&json!({
             "query": context.query,
+            "intent": context.intent.as_str(),
+            "confidenceNote": context.confidence_note,
+            "nextReads": context.next_reads,
             "summary": {
                 "entryPointCount": context.entry_points.len(),
                 "nodeCount": context.nodes.len(),
@@ -1172,6 +1247,108 @@ fn format_terms(terms: &[String], limit: usize) -> String {
         shown.push_str(", ...");
     }
     shown
+}
+
+fn apply_diagnostic_rerank(nodes: &mut [ScoredNode], analyzed: &AnalyzedQuery) {
+    if analyzed.focus_files.is_empty()
+        && analyzed.focus_symbols.is_empty()
+        && analyzed.focus_lines.is_empty()
+    {
+        return;
+    }
+    for node in nodes.iter_mut() {
+        let path_b = analyzed.path_boost(&node.node.file_path);
+        let line_b = analyzed.line_boost(
+            &node.node.file_path,
+            node.node.start_line,
+            node.node.end_line,
+        );
+        let sym_b = analyzed.symbol_boost(&node.node.name, &node.node.qualified_name);
+        let added = path_b + line_b + sym_b;
+        if added > 0.0 {
+            node.score += added;
+            if path_b > 0.0 || line_b > 0.0 {
+                node.reason.push_str(" + diagnostic locus");
+            }
+            if sym_b > 0.0 {
+                node.reason.push_str(" + focus symbol");
+            }
+        } else if matches!(analyzed.intent, QueryIntent::DebugCompile)
+            && path_b == 0.0
+            && sym_b == 0.0
+            && node.reason.contains("content match")
+            && node_query_overlap(&node.node, &analyzed.content_terms) < 2
+        {
+            // Demote vague content hits when we already have a compiler locus.
+            node.score *= 0.55;
+            node.reason.push_str(" + off-locus dampened");
+        }
+    }
+}
+
+fn build_next_reads(
+    entry_points: &[ScoredNode],
+    nodes: &[ScoredNode],
+    _analyzed: &AnalyzedQuery,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |scored: &ScoredNode| {
+        if out.len() >= 3 {
+            return;
+        }
+        let key = format!("{}:{}", scored.node.file_path, scored.node.start_line);
+        if seen.insert(key) {
+            out.push(format!(
+                "**{}** ({}) — {}:{} ({})",
+                scored.node.name,
+                scored.node.kind.as_str(),
+                scored.node.file_path,
+                scored.node.start_line,
+                compact_reason(&scored.reason)
+            ));
+        }
+    };
+
+    for scored in entry_points.iter().take(3) {
+        push(scored);
+    }
+    for scored in nodes.iter() {
+        push(scored);
+    }
+    out
+}
+
+fn confidence_from_scores(
+    entry_points: &[ScoredNode],
+    analyzed: &AnalyzedQuery,
+) -> Option<String> {
+    let top = entry_points.first()?;
+    let second = entry_points.get(1).map(|s| s.score).unwrap_or(0.0);
+    let gap = top.score - second;
+    if !analyzed.focus_files.is_empty() || !analyzed.focus_symbols.is_empty() {
+        if gap >= 40.0 || top.reason.contains("exact") || top.reason.contains("diagnostic") {
+            return Some(format!(
+                "High — diagnostic/symbol focus; top hit `{}` ({:.0})",
+                top.node.name, top.score
+            ));
+        }
+        return Some(
+            "Medium — focus signals present; inspect next-reads before expanding search".into(),
+        );
+    }
+    if top.reason.contains("single-term dampened") || gap < 15.0 {
+        return Some(
+            "Low — top hits are close/weak; narrow with a symbol or file:line".into(),
+        );
+    }
+    if gap >= 50.0 && top.reason.contains("exact") {
+        return Some(format!("High — strong exact match `{}`", top.node.name));
+    }
+    Some(format!(
+        "Medium — best entry `{}` ({:.0}); verify before broad edits",
+        top.node.name, top.score
+    ))
 }
 
 fn is_generic_utility_symbol(node: &Node) -> bool {

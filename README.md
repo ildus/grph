@@ -15,7 +15,7 @@ Rust, Python, JavaScript/TypeScript, Go, C/C++, Shell, and embedded SQL/C.**
 - **Tree-sitter first, regex fallback** — precise AST extraction for supported languages; regex as safety net
 - **Incremental sync** — `sync` detects changed files and replaces only stale graph fragments
 - **Call graph traversal** — `callers`, `callees`, and bounded BFS `trace` between symbols
-- **AI context builder** — Extracts keyword-matched source slices for agent task descriptions
+- **AI context builder** — Extracts keyword-matched source slices for agent task descriptions; detects query intent and compiler diagnostics (`file:line`, expected/actual types), demotes generic type tokens, and returns confidence + a short “Next reads” list
 - **MCP server** — JSON-RPC over stdio, 11 tools, compatible with Claude Desktop, opencode, Goose, and other MCP clients
 - **LSP server** — JSON-RPC over stdio for editor features backed by the same `.grph/grph.db` index
 - **Single binary** — ~12–14 MB, zero runtime dependencies
