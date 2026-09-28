@@ -38,6 +38,9 @@ Rust, Python, JavaScript/TypeScript, Go, C/C++, Shell, and embedded SQL/C.**
 ## Installation
 
 ```bash
+# Latest release
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ildus/grph/releases/latest/download/grph-cli-installer.sh | sh
+
 # From source (requires Rust 1.80+)
 cargo install --path grph-cli
 
