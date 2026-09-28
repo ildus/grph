@@ -84,7 +84,7 @@ grph serve --lsp
 
 | Command | Description |
 |---------|-------------|
-| `grph index [--force] [--quiet] [--no-resolve] [--file <path>] [--resolve] [--resolve-limit <n>] [-j <n>] [path]` | Create DB if needed; index the project, one file, or resolve pending references |
+| `grph index [--force] [--quiet] [--no-resolve] [--file <path>] [--resolve] [--compile-commands <path>] [--no-compile-commands] [-j <n>] [path]` | Create DB if needed; index the project or one file. `--compile-commands` is stored and reused while indexing until `--no-compile-commands` |
 | `grph status` | Show file / node / edge counts |
 | `grph query <name> [--kind <kind>] [--limit <n>] [--json]` | LIKE-based search for symbols |
 | `grph files [--format <fmt>] [--filter <pattern>] [--max-depth <n>] [--json]` | List indexed files |

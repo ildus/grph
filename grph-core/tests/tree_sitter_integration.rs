@@ -1472,3 +1472,118 @@ fn index_drops_unresolved_refs_for_deleted_files() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn incremental_index_keeps_cross_file_callers_when_callee_moves() {
+    use grph_core::Grph;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("grph-keep-callers-{stamp}"));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+    fs::write(dir.join("b.py"), "def run():\n    return helper()\n").unwrap();
+
+    let mut grph = Grph::init(&dir).unwrap();
+    grph.index(|_| {}).unwrap();
+    assert!(
+        callees_named(&grph, "run")
+            .iter()
+            .any(|name| name == "helper"),
+        "initial index should resolve run -> helper"
+    );
+
+    fs::write(dir.join("a.py"), "def helper():\n    return 42\n").unwrap();
+    grph.index(|_| {}).unwrap();
+    assert!(
+        callees_named(&grph, "run")
+            .iter()
+            .any(|name| name == "helper"),
+        "same-line edit must keep the incoming call"
+    );
+
+    fs::write(dir.join("a.py"), "# moved\ndef helper():\n    return 42\n").unwrap();
+    grph.index(|_| {}).unwrap();
+    assert!(
+        callees_named(&grph, "run")
+            .iter()
+            .any(|name| name == "helper"),
+        "line shift must retarget the incoming call"
+    );
+
+    fs::write(dir.join("a.py"), "def other():\n    return 42\n").unwrap();
+    grph.index(|_| {}).unwrap();
+    assert!(
+        !callees_named(&grph, "run")
+            .iter()
+            .any(|name| name == "helper"),
+        "removed symbol must drop the incoming call"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+fn fts_hits(grph: &grph_core::Grph, query: &str) -> i64 {
+    grph.db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH ?1",
+            rusqlite::params![query],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn callees_named(grph: &grph_core::Grph, name: &str) -> Vec<String> {
+    let node = grph.db().get_node_by_name_any(name).unwrap().unwrap();
+    grph.traverser()
+        .callees(&node.id, 20)
+        .unwrap()
+        .into_iter()
+        .map(|(node, _)| node.name)
+        .collect()
+}
+
+#[test]
+fn reopen_rebuilds_node_fts_after_dropped_triggers() {
+    use grph_core::Grph;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("grph-fts-rebuild-{stamp}"));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("main.py"), "def greet():\n    return 1\n").unwrap();
+
+    {
+        let mut grph = Grph::init(&dir).unwrap();
+        grph.index(|_| {}).unwrap();
+        grph.db().disable_node_fts_triggers().unwrap();
+        fs::write(
+            dir.join("main.py"),
+            "def greet():\n    return 1\n\ndef brand_new_symbol():\n    return 2\n",
+        )
+        .unwrap();
+        grph.index(|_| {}).unwrap();
+        assert_eq!(
+            fts_hits(&grph, "brand_new_symbol"),
+            0,
+            "symbol inserted with triggers dropped should be missing from FTS"
+        );
+    }
+
+    let grph = Grph::open(&dir).unwrap();
+    assert!(
+        fts_hits(&grph, "brand_new_symbol") > 0,
+        "reopen should rebuild the symbol search index"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}

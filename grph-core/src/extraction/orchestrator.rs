@@ -1,3 +1,4 @@
+use crate::db::queries::IncomingEdge;
 use crate::db::Database;
 use crate::errors::{GrphError, Result};
 use crate::extraction::grammars::{detect_language, detect_language_with_content};
@@ -743,12 +744,15 @@ impl ExtractionOrchestrator {
         );
         let node_count = extraction.nodes.len();
         let edge_count = extraction.edges.len();
+        let incoming = self.db.incoming_edges_for_file(&relative_path)?;
 
         self.db.delete_file_nodes(&relative_path)?;
         self.db.delete_unresolved_refs_for_file(&relative_path)?;
 
         self.db.batch_insert_nodes(&extraction.nodes)?;
         self.db.batch_insert_edges(&extraction.edges)?;
+        let restored = Self::retarget_incoming_edges(&extraction.nodes, incoming);
+        self.db.batch_insert_edges(&restored)?;
 
         let node_ids: HashSet<&str> = extraction.nodes.iter().map(|n| n.id.as_str()).collect();
         let mut unresolved_refs = Vec::new();
@@ -809,6 +813,55 @@ impl ExtractionOrchestrator {
             .upsert_file_content_fts(&file_record.path, &content)?;
 
         Ok((node_count, edge_count))
+    }
+
+    fn retarget_incoming_edges(nodes: &[Node], incoming: Vec<IncomingEdge>) -> Vec<Edge> {
+        let mut restored = Vec::with_capacity(incoming.len());
+        for incoming_edge in incoming {
+            let Some(target) = Self::match_retained_target(nodes, &incoming_edge) else {
+                continue;
+            };
+            let mut edge = incoming_edge.edge;
+            edge.target = target;
+            restored.push(edge);
+        }
+        restored
+    }
+
+    fn match_retained_target(nodes: &[Node], incoming: &IncomingEdge) -> Option<String> {
+        let same_kind: Vec<&Node> = nodes
+            .iter()
+            .filter(|node| node.kind.as_str() == incoming.target_kind)
+            .collect();
+        let by_qualified: Vec<&Node> = same_kind
+            .iter()
+            .copied()
+            .filter(|node| {
+                node.qualified_name == incoming.target_qualified_name
+                    && node.name == incoming.target_name
+            })
+            .collect();
+        if let Some(node) = Self::closest_node(&by_qualified, incoming.target_start_line) {
+            return Some(node.id.clone());
+        }
+        let by_name: Vec<&Node> = same_kind
+            .into_iter()
+            .filter(|node| node.name == incoming.target_name)
+            .collect();
+        // A unique name in the file is safe to retarget. Several symbols with the
+        // same name stay tied to the previous line so a shifted overload keeps its
+        // callers instead of attaching them to a sibling.
+        if by_name.len() == 1 {
+            return Some(by_name[0].id.clone());
+        }
+        Self::closest_node(&by_name, incoming.target_start_line).map(|node| node.id.clone())
+    }
+
+    fn closest_node<'a>(nodes: &[&'a Node], start_line: u32) -> Option<&'a Node> {
+        nodes
+            .iter()
+            .copied()
+            .min_by_key(|node| node.start_line.abs_diff(start_line))
     }
 
     /// Resolve edge targets that the regex extractor left as bare names.

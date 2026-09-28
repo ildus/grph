@@ -215,6 +215,192 @@ fn cli_index_creates_database_and_query_does_not() {
 }
 
 #[test]
+fn cli_compile_commands_hint_persists_until_cleared() {
+    let dir = temp_project("compile-commands");
+    fs::write(dir.join("main.c"), "int helper(void) { return 0; }\n").unwrap();
+    let grph = env!("CARGO_BIN_EXE_grph");
+    let hint = "build/compile_commands.json";
+
+    let first = Command::new(grph)
+        .args(["index", "--no-resolve", "--compile-commands", hint])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_out = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        first_out.contains("Using build/compile_commands.json while indexing"),
+        "{first_out}"
+    );
+
+    let second = Command::new(grph)
+        .args(["index", "--no-resolve"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_out = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        second_out.contains("Using build/compile_commands.json while indexing"),
+        "stored hint should be reused: {second_out}"
+    );
+
+    let context = Command::new(grph)
+        .args(["context", "helper"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(context.status.success());
+    let context_out = String::from_utf8_lossy(&context.stdout);
+    assert!(
+        context_out.contains("was used while indexing"),
+        "{context_out}"
+    );
+
+    let cleared = Command::new(grph)
+        .args(["index", "--no-resolve", "--no-compile-commands"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        cleared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let cleared_out = String::from_utf8_lossy(&cleared.stdout);
+    assert!(
+        !cleared_out.contains("Using build/compile_commands.json while indexing"),
+        "{cleared_out}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_index_file_keeps_callers_after_callee_edit() {
+    let dir = temp_project("keep-callers");
+    fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+    fs::write(dir.join("b.py"), "def run():\n    return helper()\n").unwrap();
+    let grph = env!("CARGO_BIN_EXE_grph");
+
+    let index = Command::new(grph).arg("index").arg(&dir).output().unwrap();
+    assert!(
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    assert_callers(grph, &dir, "helper", "run");
+
+    fs::write(dir.join("a.py"), "# moved\ndef helper():\n    return 42\n").unwrap();
+    let file_index = Command::new(grph)
+        .args(["index", "--file"])
+        .arg(dir.join("a.py"))
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        file_index.status.success(),
+        "index --file failed: {}",
+        String::from_utf8_lossy(&file_index.stderr)
+    );
+    assert_callers(grph, &dir, "helper", "run");
+
+    fs::write(dir.join("a.py"), "def other():\n    return 42\n").unwrap();
+    let again = Command::new(grph).arg("index").arg(&dir).output().unwrap();
+    assert!(
+        again.status.success(),
+        "reindex failed: {}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let callers = Command::new(grph)
+        .args(["callers", "helper"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        !callers.status.success(),
+        "removed helper should no longer resolve: {}",
+        String::from_utf8_lossy(&callers.stdout)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+fn assert_callers(grph: &str, dir: &std::path::Path, symbol: &str, caller: &str) {
+    let callers = Command::new(grph)
+        .args(["callers", symbol])
+        .arg(dir)
+        .output()
+        .unwrap();
+    assert!(
+        callers.status.success(),
+        "callers {symbol} failed: {}",
+        String::from_utf8_lossy(&callers.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&callers.stdout);
+    assert!(
+        stdout.contains(&format!("Callers of \"{symbol}\" (1):")),
+        "{stdout}"
+    );
+    assert!(stdout.contains(caller), "{stdout}");
+}
+
+#[test]
+fn cli_compile_commands_flags_conflict_and_detected_file_is_mentioned() {
+    let dir = temp_project("compile-commands-flags");
+    fs::write(dir.join("main.c"), "int helper(void) { return 0; }\n").unwrap();
+    fs::write(dir.join("compile_commands.json"), "[]\n").unwrap();
+    let grph = env!("CARGO_BIN_EXE_grph");
+
+    let plain = Command::new(grph)
+        .args(["index", "--no-resolve"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain_out = String::from_utf8_lossy(&plain.stdout);
+    assert!(
+        plain_out.contains("not used while indexing"),
+        "{plain_out}"
+    );
+    assert!(
+        plain_out.contains("compile_commands.json"),
+        "{plain_out}"
+    );
+
+    let both = Command::new(grph)
+        .args([
+            "index",
+            "--compile-commands",
+            "compile_commands.json",
+            "--no-compile-commands",
+        ])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(!both.status.success());
+    let err = String::from_utf8_lossy(&both.stderr);
+    assert!(
+        err.contains("--compile-commands and --no-compile-commands cannot be used together"),
+        "{err}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn cli_query_formats_rust_signature_without_body_marker() {
     let dir = temp_project("rust-signature");
     fs::write(

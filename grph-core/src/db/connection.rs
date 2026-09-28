@@ -43,8 +43,15 @@ impl Database {
         let conn = Connection::open(&db_path)?;
         configure_connection(&conn)?;
         let db = Self { conn, db_path };
+        // A killed index can drop the symbol-search triggers before it rebuilds
+        // the FTS index. Recreate them from the schema, then rebuild FTS so the
+        // next small index is not left with a stale search index.
+        let triggers_present = db.node_fts_triggers_present()?;
         db.init_schema()?;
         db.enable_wal()?;
+        if !triggers_present {
+            db.rebuild_nodes_fts()?;
+        }
         Ok(db)
     }
 

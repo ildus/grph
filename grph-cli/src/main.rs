@@ -31,9 +31,13 @@ enum Commands {
         /// Skip post-index cross-file resolution; run `grph index --resolve` later
         #[arg(long)]
         no_resolve: bool,
-        /// Use compile_commands.json as a C/C++/Esqlc resolver hint; does not restrict scanning
+        /// Use compile_commands.json as a C/C++/Esqlc resolver hint while indexing.
+        /// The scan is not restricted. The path is stored and reused by later indexes.
         #[arg(long)]
         compile_commands: Option<PathBuf>,
+        /// Forget a compile_commands.json hint stored by an earlier index
+        #[arg(long)]
+        no_compile_commands: bool,
         /// Index only this file
         #[arg(long)]
         file: Option<PathBuf>,
@@ -224,13 +228,19 @@ fn run() -> grph_core::Result<()> {
             jobs,
             no_resolve,
             compile_commands,
+            no_compile_commands,
             file,
             resolve,
             resolve_limit,
         } => {
             let path = resolve_path(&path);
+            let mut grph = grph_core::Grph::open_or_create(&path)?;
+            grph.update_compile_commands_hint(compile_commands.as_deref(), no_compile_commands)?;
+            if !quiet {
+                print_compile_commands_status(&grph, &path);
+            }
             if resolve {
-                let grph = grph_core::Grph::open_or_create(&path)?;
+                let grph = grph;
                 let resolved = if let Some(file) = file {
                     let file = resolve_file(&path, file);
                     grph.resolve_pending_refs_for_file_with_progress(
@@ -252,7 +262,6 @@ fn run() -> grph_core::Result<()> {
                 print_resolution_result("pending", &resolved);
             } else if let Some(file) = file {
                 let file = resolve_file(&path, file);
-                let mut grph = grph_core::Grph::open_or_create(&path)?;
                 if !quiet {
                     eprintln!("Indexing {}...", file.display());
                 }
@@ -269,13 +278,8 @@ fn run() -> grph_core::Result<()> {
                     result.files_deleted
                 );
             } else {
-                let mut grph = grph_core::Grph::open_or_create(&path)?;
-
                 if !quiet {
                     println!("Indexing...");
-                    if compile_commands.is_none() {
-                        print_compile_commands_hint(&path);
-                    }
                 }
 
                 let result = grph.index_with_jobs_force_resolve_and_compile_commands(
@@ -283,6 +287,7 @@ fn run() -> grph_core::Result<()> {
                     force,
                     !no_resolve,
                     compile_commands.as_deref(),
+                    no_compile_commands,
                     |progress| {
                         if !quiet {
                             print_index_progress(&progress);
@@ -536,10 +541,23 @@ fn run() -> grph_core::Result<()> {
     Ok(())
 }
 
-fn print_compile_commands_hint(project_root: &std::path::Path) {
+fn print_compile_commands_status(grph: &grph_core::Grph, project_root: &std::path::Path) {
+    let stored = grph
+        .db()
+        .get_project_metadata("index.compile_commands.path")
+        .ok()
+        .flatten()
+        .filter(|path| !path.is_empty());
+    if let Some(path) = stored {
+        println!(
+            "Using {} while indexing for C-family resolution. The repository scan is not restricted.",
+            path
+        );
+        return;
+    }
     if let Some(found) = grph_core::detect_compile_commands(project_root) {
         println!(
-            "Detected {}. It is not used unless passed with --compile-commands {}",
+            "Detected {}. It is not used while indexing unless passed with --compile-commands {}.",
             found.display(),
             found.display()
         );

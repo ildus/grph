@@ -107,8 +107,44 @@ impl Grph {
             false,
             resolve,
             compile_commands,
+            false,
             progress,
         )
+    }
+
+    /// Record, clear, or keep the compile_commands.json hint used while indexing.
+    ///
+    /// `clear` removes a stored hint. A path stores it for this index and later
+    /// ones. Neither leaves the stored hint in place so the resolver keeps
+    /// using it.
+    pub fn update_compile_commands_hint(
+        &self,
+        compile_commands: Option<&std::path::Path>,
+        clear: bool,
+    ) -> Result<()> {
+        if clear {
+            if compile_commands.is_some() {
+                return Err(GrphError::InvalidInput(
+                    "--compile-commands and --no-compile-commands cannot be used together".into(),
+                ));
+            }
+            return self
+                .db
+                .delete_project_metadata("index.compile_commands.path");
+        }
+        let Some(path) = compile_commands else {
+            return Ok(());
+        };
+        let stored = if path.is_absolute() {
+            path.strip_prefix(&self.project_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        } else {
+            path.to_string_lossy().replace('\\', "/")
+        };
+        self.db
+            .set_project_metadata("index.compile_commands.path", &stored)
     }
 
     pub fn index_with_jobs_force_resolve_and_compile_commands(
@@ -117,23 +153,10 @@ impl Grph {
         force: bool,
         resolve: bool,
         compile_commands: Option<&std::path::Path>,
+        clear_compile_commands: bool,
         progress: impl Fn(extraction::IndexProgress),
     ) -> Result<extraction::IndexResult> {
-        if let Some(path) = compile_commands {
-            let stored = if path.is_absolute() {
-                path.strip_prefix(&self.project_root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            } else {
-                path.to_string_lossy().replace('\\', "/")
-            };
-            self.db
-                .set_project_metadata("index.compile_commands.path", &stored)?;
-        } else {
-            self.db
-                .delete_project_metadata("index.compile_commands.path")?;
-        }
+        self.update_compile_commands_hint(compile_commands, clear_compile_commands)?;
 
         let mut orchestrator =
             ExtractionOrchestrator::new(self.db.clone(), self.project_root.clone())?;
@@ -308,14 +331,14 @@ impl Grph {
         )?;
         if let Ok(Some(path)) = self.db.get_project_metadata("index.compile_commands.path") {
             context = format!(
-                "> Index note: compile_commands.json hint '{}' was used for C-family resolution. The repository scan was not restricted; resolver preferences may reflect that build/platform configuration.
+                "> Index note: compile_commands.json hint '{}' was used while indexing for C-family resolution. The repository scan was not restricted; resolver preferences may reflect that build/platform configuration.
 
 {}",
                 path, context
             );
         } else if let Some(path) = compile_commands::detect_compile_commands(&self.project_root) {
             context = format!(
-                "> Index note: detected '{}'. It was not used for this index. Run 'grph index --compile-commands {}' to use it as a C-family resolver hint.
+                "> Index note: detected '{}'. It was not used while indexing. Run 'grph index --compile-commands {}' to use it as a C-family resolver hint.
 
 {}",
                 path.display(), path.display(), context

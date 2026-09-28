@@ -4,6 +4,18 @@ use crate::types::{Edge, EdgeKind, FileRecord, Node, NodeKind, UnresolvedRef, Un
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 
+/// Cross-file edge that points at a symbol in a file about to be reindexed.
+///
+/// Node ids include the start line, so replacing the file assigns new ids.
+/// These edges are retargeted after the new nodes are inserted.
+pub struct IncomingEdge {
+    pub edge: Edge,
+    pub target_name: String,
+    pub target_qualified_name: String,
+    pub target_kind: String,
+    pub target_start_line: u32,
+}
+
 impl Database {
     // ==================== Node operations ====================
 
@@ -1225,6 +1237,55 @@ impl Database {
         self.conn()
             .execute("DELETE FROM unresolved_refs WHERE rowid = ?1", params![id])?;
         Ok(())
+    }
+
+    pub fn node_fts_triggers_present(&self) -> Result<bool> {
+        let count: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'trigger' AND name IN ('nodes_ai', 'nodes_ad', 'nodes_au')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count == 3)
+    }
+
+    /// Edges from other files whose target is a node in `file_path`.
+    pub fn incoming_edges_for_file(&self, file_path: &str) -> Result<Vec<IncomingEdge>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT e.source, e.target, e.kind, e.metadata, e.line, e.col, e.provenance,
+                    n.name, n.qualified_name, n.kind, n.start_line
+             FROM edges e
+             JOIN nodes n ON n.id = e.target
+             WHERE n.file_path = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM nodes src
+                   WHERE src.id = e.source AND src.file_path = ?1
+               )",
+        )?;
+        let rows = stmt.query_map(params![file_path], |row| {
+            let kind: String = row.get(2)?;
+            let metadata: Option<String> = row.get(3)?;
+            Ok(IncomingEdge {
+                edge: Edge {
+                    source: row.get(0)?,
+                    target: row.get(1)?,
+                    kind: EdgeKind::from_str(&kind).unwrap_or(EdgeKind::References),
+                    metadata: metadata.and_then(|value| serde_json::from_str(&value).ok()),
+                    line: row.get::<_, Option<i64>>(4)?.map(|line| line as u32),
+                    col: row.get::<_, Option<i64>>(5)?.map(|col| col as u32),
+                    provenance: row.get(6)?,
+                },
+                target_name: row.get(7)?,
+                target_qualified_name: row.get(8)?,
+                target_kind: row.get(9)?,
+                target_start_line: row.get(10)?,
+            })
+        })?;
+        let mut edges = Vec::new();
+        for row in rows {
+            edges.push(row?);
+        }
+        Ok(edges)
     }
 
     pub fn delete_file_nodes(&self, file_path: &str) -> Result<()> {
