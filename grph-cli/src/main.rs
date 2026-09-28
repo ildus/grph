@@ -14,25 +14,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize Grph in a project
-    Init {
-        /// Also run initial indexing
-        #[arg(short = 'i', long)]
-        index: bool,
-        /// Number of parallel parsing workers
-        #[arg(short = 'j', long)]
-        jobs: Option<usize>,
-        /// Skip post-index cross-file resolution; run `grph sync --resolve` later
-        #[arg(long)]
-        no_resolve: bool,
-        /// Use compile_commands.json as a C/C++/Esqlc resolver hint; does not restrict scanning
-        #[arg(long)]
-        compile_commands: Option<PathBuf>,
-        /// Project path
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
-
     /// Build the knowledge graph index
     Index {
         /// Project path
@@ -236,38 +217,6 @@ fn main() -> grph_core::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init {
-            index,
-            jobs,
-            no_resolve,
-            compile_commands,
-            path,
-        } => {
-            let path = resolve_path(&path);
-            let grph = grph_core::Grph::init(&path)?;
-
-            if index {
-                println!("Starting initial index...");
-                if compile_commands.is_none() {
-                    print_compile_commands_hint(&path);
-                }
-                let mut grph = grph; // make mutable for indexing
-                let result = grph.index_with_jobs_resolve_and_compile_commands(
-                    index_jobs(jobs),
-                    !no_resolve,
-                    compile_commands.as_deref(),
-                    |progress| {
-                        print_index_progress(&progress);
-                    },
-                )?;
-                println!(
-                    "Indexed {} files, {} nodes, {} edges",
-                    result.files_indexed, result.nodes_created, result.edges_created
-                );
-            } else {
-                println!("Initialized. Run `grph index` to build the index.");
-            }
-        }
         Commands::Index {
             path,
             force,

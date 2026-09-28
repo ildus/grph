@@ -49,8 +49,8 @@ cargo build --release
 ## Quick Start
 
 ```bash
-# Initialize the code graph in your project
-grph init -i
+# Index the codebase (creates .grph/grph.db if needed)
+grph index
 
 # Search for symbols
 grph query "handle_login"
@@ -84,10 +84,8 @@ grph serve --lsp
 
 | Command | Description |
 |---------|-------------|
-| `grph init` | Initialize `.grph/grph.db` database |
-| `grph init -i [--no-resolve]` | Initialize + index all files |
-| `grph index [--force] [--quiet] [--no-resolve] [-j <n>] [path]` | Extract symbols and edges from all source files |
-| `grph sync [--file <path>] [--resolve] [--resolve-limit <n>] [path]` | Incremental sync, or resolve pending references without re-indexing |
+| `grph index [--force] [--quiet] [--no-resolve] [-j <n>] [path]` | Create DB if needed; extract symbols and edges from all source files |
+| `grph sync [--file <path>] [--resolve] [--resolve-limit <n>] [path]` | Create DB if needed; incremental sync, or resolve pending references without re-indexing |
 | `grph status` | Show file / node / edge counts |
 | `grph query <name> [--kind <kind>] [--limit <n>] [--json]` | LIKE-based search for symbols |
 | `grph files [--format <fmt>] [--filter <pattern>] [--max-depth <n>] [--json]` | List indexed files |
@@ -194,7 +192,7 @@ Start the LSP server for editors that can launch a stdio language server:
 grph serve --lsp
 ```
 
-`grph serve --lsp` uses the current directory by default. Pass `--path /path/to/project` when the editor cannot set `cwd`. The project must already be initialized and indexed with `grph init -i`.
+`grph serve --lsp` uses the current directory by default. Pass `--path /path/to/project` when the editor cannot set `cwd`. The project must already be indexed with `grph index` (or `grph sync`).
 
 Supported LSP features:
 

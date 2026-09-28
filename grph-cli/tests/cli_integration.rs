@@ -34,15 +34,15 @@ class App:
 
     let grph = env!("CARGO_BIN_EXE_grph");
 
-    let init = Command::new(grph)
-        .args(["init", "-i"])
+    let index = Command::new(grph)
+        .arg("index")
         .arg(&dir)
         .output()
         .unwrap();
     assert!(
-        init.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init.stderr)
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
     );
 
     let query = Command::new(grph)
@@ -96,15 +96,15 @@ fn cli_query_no_results_suggests_context() {
     .unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let init = Command::new(grph)
-        .args(["init", "-i"])
+    let index = Command::new(grph)
+        .arg("index")
         .arg(&dir)
         .output()
         .unwrap();
     assert!(
-        init.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init.stderr)
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
     );
 
     let query = Command::new(grph)
@@ -144,15 +144,15 @@ fn cli_query_prioritizes_source_over_build_artifacts() {
     .unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let init = Command::new(grph)
-        .args(["init", "-i"])
+    let index = Command::new(grph)
+        .arg("index")
         .arg(&dir)
         .output()
         .unwrap();
     assert!(
-        init.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init.stderr)
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
     );
 
     let query = Command::new(grph)
@@ -170,33 +170,37 @@ fn cli_query_prioritizes_source_over_build_artifacts() {
 }
 
 #[test]
-fn cli_init_is_idempotent() {
-    let dir = temp_project("init-idempotent");
+fn cli_index_and_sync_create_database() {
+    let dir = temp_project("index-creates-db");
+    fs::write(dir.join("main.py"), "def greet():\n    return 1\n").unwrap();
     let grph = env!("CARGO_BIN_EXE_grph");
+    let db = dir.join(".grph").join("grph.db");
 
-    let first = Command::new(grph).arg("init").arg(&dir).output().unwrap();
+    assert!(!db.exists());
+    let index = Command::new(grph).arg("index").arg(&dir).output().unwrap();
     assert!(
-        first.status.success(),
-        "first init failed: {}",
-        String::from_utf8_lossy(&first.stderr)
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
     );
+    assert!(db.is_file(), "index should create .grph/grph.db");
 
-    let second = Command::new(grph).arg("init").arg(&dir).output().unwrap();
+    fs::remove_dir_all(dir.join(".grph")).unwrap();
+    assert!(!db.exists());
+
+    let sync = Command::new(grph).arg("sync").arg(&dir).output().unwrap();
     assert!(
-        second.status.success(),
-        "second init should be idempotent, stderr: {}",
-        String::from_utf8_lossy(&second.stderr)
+        sync.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&sync.stderr)
     );
+    assert!(db.is_file(), "sync should create .grph/grph.db");
 
-    let init_index = Command::new(grph)
-        .args(["init", "-i"])
-        .arg(&dir)
-        .output()
-        .unwrap();
+    let again = Command::new(grph).arg("index").arg(&dir).output().unwrap();
     assert!(
-        init_index.status.success(),
-        "init -i should also be idempotent, stderr: {}",
-        String::from_utf8_lossy(&init_index.stderr)
+        again.status.success(),
+        "re-index should succeed on existing db: {}",
+        String::from_utf8_lossy(&again.stderr)
     );
 
     fs::remove_dir_all(dir).ok();
@@ -212,15 +216,15 @@ fn cli_query_formats_rust_signature_without_body_marker() {
     .unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let init = Command::new(grph)
-        .args(["init", "-i"])
+    let index = Command::new(grph)
+        .arg("index")
         .arg(&dir)
         .output()
         .unwrap();
     assert!(
-        init.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init.stderr)
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
     );
 
     let query = Command::new(grph)
@@ -254,15 +258,15 @@ fn cli_generates_universal_ctags_file() {
     .unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let init = Command::new(grph)
-        .args(["init", "-i"])
+    let index = Command::new(grph)
+        .arg("index")
         .arg(&dir)
         .output()
         .unwrap();
     assert!(
-        init.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init.stderr)
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
     );
 
     let ctags = Command::new(grph).arg("ctags").arg(&dir).output().unwrap();
@@ -330,15 +334,15 @@ fn cli_mcp_stdio_content_length_end_to_end() {
     fs::write(dir.join("main.py"), "def greet():\n    return 1\n").unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let init = Command::new(grph)
-        .args(["init", "-i"])
+    let index = Command::new(grph)
+        .arg("index")
         .arg(&dir)
         .output()
         .unwrap();
     assert!(
-        init.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init.stderr)
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
     );
 
     let mut child = Command::new(grph)
@@ -427,15 +431,15 @@ fn cli_context_surfaces_relevant_tail_callee_from_large_function() {
     fs::write(dir.join("main.rs"), source).unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let init = Command::new(grph)
-        .args(["init", "-i"])
+    let index = Command::new(grph)
+        .arg("index")
         .arg(&dir)
         .output()
         .unwrap();
     assert!(
-        init.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init.stderr)
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
     );
 
     let context = Command::new(grph)

@@ -22,7 +22,10 @@ impl Clone for Database {
 }
 
 impl Database {
-    /// Open (or create) the database at `.grph/grph.db`
+    /// Open (or create) the database at `.grph/grph.db`.
+    ///
+    /// Creates the `.grph` directory and schema on first use so `grph index`
+    /// / `grph sync` do not require a separate init step.
     pub fn open(project_root: &Path) -> Result<Self> {
         let db_path = project_root.join(".grph").join("grph.db");
         let db_path_parent = db_path.parent().unwrap();
@@ -31,19 +34,8 @@ impl Database {
         let conn = Connection::open(&db_path)?;
         configure_connection(&conn)?;
         let db = Self { conn, db_path };
-        // Existing projects may predate newer schema objects. Run idempotent
-        // migrations on open so MCP/CLI tools can use new indexes immediately.
-        if db
-            .conn
-            .query_row(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_versions'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .is_ok()
-        {
-            run_migrations(&db)?;
-        }
+        db.init_schema()?;
+        db.enable_wal()?;
         Ok(db)
     }
 

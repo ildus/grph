@@ -8,8 +8,8 @@ CREATE TABLE IF NOT EXISTS schema_versions (
     description TEXT
 );
 
--- Insert initial version. Must be idempotent because `grph init` can be
--- run repeatedly in an existing project.
+-- Insert initial version. Must be idempotent because open/index/sync can
+-- create or reopen the database repeatedly.
 INSERT OR IGNORE INTO schema_versions (version, applied_at, description)
 VALUES (4, strftime('%s', 'now') * 1000, 'Initial schema');
 

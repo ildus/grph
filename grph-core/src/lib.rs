@@ -28,24 +28,21 @@ pub struct Grph {
 }
 
 impl Grph {
-    /// Initialize Grph in a project directory
-    pub fn init(project_root: &std::path::Path) -> Result<Self> {
-        let db = Database::open(project_root)?;
-        db.init_schema()?;
-        db.enable_wal()?;
-        Ok(Self {
-            db,
-            project_root: project_root.to_path_buf(),
-        })
-    }
-
-    /// Open an existing Grph database
+    /// Open (or create) the Grph database for a project directory.
+    ///
+    /// Creates `.grph/grph.db` and the schema if missing. Prefer this for
+    /// indexing and syncing; a separate init step is not required.
     pub fn open(project_root: &std::path::Path) -> Result<Self> {
         let db = Database::open(project_root)?;
         Ok(Self {
             db,
             project_root: project_root.to_path_buf(),
         })
+    }
+
+    /// Alias for [`Self::open`]. Kept for call sites that historically used init.
+    pub fn init(project_root: &std::path::Path) -> Result<Self> {
+        Self::open(project_root)
     }
 
     /// Get the database connection

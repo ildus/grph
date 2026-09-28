@@ -125,7 +125,7 @@ impl McpSession {
                     }
                     return Some(tool_call_result(
                         pending.id,
-                        tools::mcp_error("No Grph project is loaded. Client roots/list returned no usable file:// root. Pass projectPath in the tool arguments or start grph serve --mcp from an initialized project."),
+                        tools::mcp_error("No Grph project is loaded. Client roots/list returned no usable file:// root. Pass projectPath in the tool arguments or start grph serve --mcp from an indexed project."),
                     ));
                 }
             }
@@ -347,7 +347,7 @@ fn has_grph_db(path: &std::path::Path) -> bool {
 
 fn no_project_message(launch_root: &std::path::Path) -> String {
     format!(
-        "No Grph project is loaded. Looked in {}. Start grph serve --mcp from an initialized project, initialize with rootUri/workspaceFolders, or pass projectPath in the tool arguments.",
+        "No Grph project is loaded. Looked in {}. Start grph serve --mcp from an indexed project, set rootUri/workspaceFolders, or pass projectPath in the tool arguments.",
         launch_root.display()
     )
 }
