@@ -34,4 +34,9 @@ Start with **grph_context** for code questions. Use 2-3 grph calls maximum; do n
 ## Limitations
 - Index has ~1s lag after file changes
 - Cross-file resolution is best-effort
+
+## After you change files
+When you create, edit, or delete source files, refresh only those paths before the next grph query:
+`grph index --file <path>`
+Run that once per changed file. Use a full `grph index` only when many files changed or the project has no index yet.
 "#;

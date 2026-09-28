@@ -1231,7 +1231,9 @@ impl Database {
         // Edges can point at node IDs, but regex extraction currently stores
         // unresolved call targets as names. Delete edges whose source/target is
         // one of this file's node IDs before deleting nodes, otherwise re-index
-        // and sync create duplicate outgoing edges.
+        // creates duplicate outgoing edges. Also drop this file's pending
+        // references so a later resolve pass cannot attach edges to removed nodes.
+        self.delete_unresolved_refs_for_file(file_path)?;
         self.conn().execute(
             "DELETE FROM edges
              WHERE source IN (SELECT id FROM nodes WHERE file_path = ?1)

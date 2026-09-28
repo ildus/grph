@@ -13,7 +13,7 @@ Rust, Python, JavaScript/TypeScript, Go, C/C++, Shell, and embedded SQL/C.**
 
 - **Code graph extraction** — Functions, classes, interfaces, methods, imports, constants, decorators, and their relationships (`calls`, `contains`, `imports`, `extends`, `implements`, `decorates`)
 - **Tree-sitter first, regex fallback** — precise AST extraction for supported languages; regex as safety net
-- **Incremental sync** — `sync` detects changed files and replaces only stale graph fragments
+- **Incremental index** — `index` updates changed files; `index --file` refreshes one path
 - **Call graph traversal** — `callers`, `callees`, and bounded BFS `trace` between symbols
 - **AI context builder** — Extracts keyword-matched source slices for agent task descriptions; detects query intent and compiler diagnostics (`file:line`, expected/actual types), demotes generic type tokens, and returns confidence + a short “Next reads” list
 - **MCP server** — JSON-RPC over stdio, 11 tools, compatible with Claude Desktop, opencode, Goose, and other MCP clients
@@ -84,8 +84,7 @@ grph serve --lsp
 
 | Command | Description |
 |---------|-------------|
-| `grph index [--force] [--quiet] [--no-resolve] [-j <n>] [path]` | Create DB if needed; extract symbols and edges from all source files |
-| `grph sync [--file <path>] [--resolve] [--resolve-limit <n>] [path]` | Create DB if needed; incremental sync, or resolve pending references without re-indexing |
+| `grph index [--force] [--quiet] [--no-resolve] [--file <path>] [--resolve] [--resolve-limit <n>] [-j <n>] [path]` | Create DB if needed; index the project, one file, or resolve pending references |
 | `grph status` | Show file / node / edge counts |
 | `grph query <name> [--kind <kind>] [--limit <n>] [--json]` | LIKE-based search for symbols |
 | `grph files [--format <fmt>] [--filter <pattern>] [--max-depth <n>] [--json]` | List indexed files |
@@ -192,7 +191,7 @@ Start the LSP server for editors that can launch a stdio language server:
 grph serve --lsp
 ```
 
-`grph serve --lsp` uses the current directory by default. Pass `--path /path/to/project` when the editor cannot set `cwd`. The project must already be indexed with `grph index` (or `grph sync`).
+`grph serve --lsp` uses the current directory by default. Pass `--path /path/to/project` when the editor cannot set `cwd`. The project must already be indexed with `grph index`.
 
 Supported LSP features:
 
@@ -202,7 +201,7 @@ Supported LSP features:
 - Hover
 - Workspace symbol search
 - Call hierarchy incoming and outgoing calls
-- Incremental sync on document save
+- Incremental index of the saved file
 
 ## Project Structure
 

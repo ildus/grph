@@ -1433,3 +1433,42 @@ fn c_platform_resolution_prefers_unix_win_implementation() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn index_drops_unresolved_refs_for_deleted_files() {
+    use grph_core::Grph;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("grph-delete-unresolved-{stamp}"));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("main.py"), "def run():\n    return helper()\n").unwrap();
+
+    let mut grph = Grph::init(&dir).unwrap();
+    grph.index_with_jobs_and_resolve(1, false, |_| {}).unwrap();
+    let before = grph
+        .db()
+        .get_unresolved_refs_for_file("main.py", 100)
+        .unwrap();
+    assert!(
+        before.iter().any(|r| r.reference_name == "helper"),
+        "expected pending helper ref, got {before:?}"
+    );
+
+    fs::remove_file(dir.join("main.py")).unwrap();
+    grph.index_with_jobs_and_resolve(1, false, |_| {}).unwrap();
+    let after = grph
+        .db()
+        .get_unresolved_refs_for_file("main.py", 100)
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "deleted file left unresolved refs: {after:?}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}

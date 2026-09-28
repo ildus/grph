@@ -34,11 +34,7 @@ class App:
 
     let grph = env!("CARGO_BIN_EXE_grph");
 
-    let index = Command::new(grph)
-        .arg("index")
-        .arg(&dir)
-        .output()
-        .unwrap();
+    let index = Command::new(grph).arg("index").arg(&dir).output().unwrap();
     assert!(
         index.status.success(),
         "index failed: {}",
@@ -96,11 +92,7 @@ fn cli_query_no_results_suggests_context() {
     .unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let index = Command::new(grph)
-        .arg("index")
-        .arg(&dir)
-        .output()
-        .unwrap();
+    let index = Command::new(grph).arg("index").arg(&dir).output().unwrap();
     assert!(
         index.status.success(),
         "index failed: {}",
@@ -144,11 +136,7 @@ fn cli_query_prioritizes_source_over_build_artifacts() {
     .unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let index = Command::new(grph)
-        .arg("index")
-        .arg(&dir)
-        .output()
-        .unwrap();
+    let index = Command::new(grph).arg("index").arg(&dir).output().unwrap();
     assert!(
         index.status.success(),
         "index failed: {}",
@@ -170,13 +158,27 @@ fn cli_query_prioritizes_source_over_build_artifacts() {
 }
 
 #[test]
-fn cli_index_and_sync_create_database() {
+fn cli_index_creates_database_and_query_does_not() {
     let dir = temp_project("index-creates-db");
     fs::write(dir.join("main.py"), "def greet():\n    return 1\n").unwrap();
     let grph = env!("CARGO_BIN_EXE_grph");
     let db = dir.join(".grph").join("grph.db");
 
     assert!(!db.exists());
+    let query = Command::new(grph)
+        .args(["query", "greet"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        !query.status.success(),
+        "query should fail before index: {}",
+        String::from_utf8_lossy(&query.stdout)
+    );
+    let query_err = String::from_utf8_lossy(&query.stderr);
+    assert!(query_err.contains("run `grph index` first"), "{query_err}");
+    assert!(!db.exists(), "query must not create .grph/grph.db");
+
     let index = Command::new(grph).arg("index").arg(&dir).output().unwrap();
     assert!(
         index.status.success(),
@@ -188,20 +190,26 @@ fn cli_index_and_sync_create_database() {
     fs::remove_dir_all(dir.join(".grph")).unwrap();
     assert!(!db.exists());
 
-    let sync = Command::new(grph).arg("sync").arg(&dir).output().unwrap();
+    let file_index = Command::new(grph)
+        .args(["index", "--file"])
+        .arg(dir.join("main.py"))
+        .arg(&dir)
+        .output()
+        .unwrap();
     assert!(
-        sync.status.success(),
-        "sync failed: {}",
-        String::from_utf8_lossy(&sync.stderr)
+        file_index.status.success(),
+        "index --file failed: {}",
+        String::from_utf8_lossy(&file_index.stderr)
     );
-    assert!(db.is_file(), "sync should create .grph/grph.db");
+    assert!(db.is_file(), "index --file should create .grph/grph.db");
 
-    let again = Command::new(grph).arg("index").arg(&dir).output().unwrap();
-    assert!(
-        again.status.success(),
-        "re-index should succeed on existing db: {}",
-        String::from_utf8_lossy(&again.stderr)
-    );
+    let found = Command::new(grph)
+        .args(["query", "greet"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(found.status.success());
+    assert!(String::from_utf8_lossy(&found.stdout).contains("greet"));
 
     fs::remove_dir_all(dir).ok();
 }
@@ -216,11 +224,7 @@ fn cli_query_formats_rust_signature_without_body_marker() {
     .unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let index = Command::new(grph)
-        .arg("index")
-        .arg(&dir)
-        .output()
-        .unwrap();
+    let index = Command::new(grph).arg("index").arg(&dir).output().unwrap();
     assert!(
         index.status.success(),
         "index failed: {}",
@@ -258,11 +262,7 @@ fn cli_generates_universal_ctags_file() {
     .unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let index = Command::new(grph)
-        .arg("index")
-        .arg(&dir)
-        .output()
-        .unwrap();
+    let index = Command::new(grph).arg("index").arg(&dir).output().unwrap();
     assert!(
         index.status.success(),
         "index failed: {}",
@@ -334,11 +334,7 @@ fn cli_mcp_stdio_content_length_end_to_end() {
     fs::write(dir.join("main.py"), "def greet():\n    return 1\n").unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let index = Command::new(grph)
-        .arg("index")
-        .arg(&dir)
-        .output()
-        .unwrap();
+    let index = Command::new(grph).arg("index").arg(&dir).output().unwrap();
     assert!(
         index.status.success(),
         "index failed: {}",
@@ -431,11 +427,7 @@ fn cli_context_surfaces_relevant_tail_callee_from_large_function() {
     fs::write(dir.join("main.rs"), source).unwrap();
 
     let grph = env!("CARGO_BIN_EXE_grph");
-    let index = Command::new(grph)
-        .arg("index")
-        .arg(&dir)
-        .output()
-        .unwrap();
+    let index = Command::new(grph).arg("index").arg(&dir).output().unwrap();
     assert!(
         index.status.success(),
         "index failed: {}",

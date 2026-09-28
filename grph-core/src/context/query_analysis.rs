@@ -347,11 +347,11 @@ fn extract_diagnostics(query: &str) -> Vec<DiagnosticHint> {
         r"(?P<path>(?:[A-Za-z]:)?(?:/|\\)?[\w./\\+-]+\.[A-Za-z0-9]+):(?P<line>\d+)(?::(?P<col>\d+))?",
     )
     .unwrap();
-    let expected_re =
-        regex::Regex::new(r"(?i)expected\s+'([^']+)'\s+but\s+argument\s+is\s+of\s+type\s+'([^']+)'")
-            .unwrap();
-    let expected_re2 =
-        regex::Regex::new(r"(?i)expected\s+`([^`]+)`,\s*found\s+`([^`]+)`").unwrap();
+    let expected_re = regex::Regex::new(
+        r"(?i)expected\s+'([^']+)'\s+but\s+argument\s+is\s+of\s+type\s+'([^']+)'",
+    )
+    .unwrap();
+    let expected_re2 = regex::Regex::new(r"(?i)expected\s+`([^`]+)`,\s*found\s+`([^`]+)`").unwrap();
     let note_arg_re = regex::Regex::new(
         r"(?i)note:\s*expected\s+'([^']+)'\s+but\s+argument\s+is\s+of\s+type\s+'([^']+)'",
     )
@@ -370,12 +370,9 @@ fn extract_diagnostics(query: &str) -> Vec<DiagnosticHint> {
     let mut symbols = Vec::new();
     // "passing argument N of 'Foo'" / "in call to `Foo`" / "In function 'Foo'"
     let sym_res = [
-        regex::Regex::new(r"(?i)passing argument \d+ of ['`]([A-Za-z_][A-Za-z0-9_]*)['`]")
-            .unwrap(),
-        regex::Regex::new(r"(?i)in (?:call to|function) ['`]([A-Za-z_][A-Za-z0-9_]*)['`]")
-            .unwrap(),
-        regex::Regex::new(r"(?i)undefined reference to ['`]([A-Za-z_][A-Za-z0-9_]*)['`]")
-            .unwrap(),
+        regex::Regex::new(r"(?i)passing argument \d+ of ['`]([A-Za-z_][A-Za-z0-9_]*)['`]").unwrap(),
+        regex::Regex::new(r"(?i)in (?:call to|function) ['`]([A-Za-z_][A-Za-z0-9_]*)['`]").unwrap(),
+        regex::Regex::new(r"(?i)undefined reference to ['`]([A-Za-z_][A-Za-z0-9_]*)['`]").unwrap(),
         regex::Regex::new(
             r"(?i)(?:undeclared identifier|undeclared)\s+['`]([A-Za-z_][A-Za-z0-9_]*)['`]",
         )
@@ -476,10 +473,7 @@ fn shared_meaningful_segments(a: &str, b: &str) -> usize {
                 | "ingres"
         )
     };
-    let set_a: HashSet<_> = a
-        .split('/')
-        .filter(|s| !skip(s) && s.len() > 1)
-        .collect();
+    let set_a: HashSet<_> = a.split('/').filter(|s| !skip(s) && s.len() > 1).collect();
     b.split('/')
         .filter(|s| !skip(s) && s.len() > 1 && set_a.contains(s))
         .count()
@@ -662,10 +656,7 @@ mod tests {
         let diags = extract_diagnostics(q);
         assert!(diags.len() >= 2);
         assert!(diags.iter().any(|d| {
-            d.file_path
-                .as_deref()
-                .is_some_and(|p| p.ends_with("te.h"))
-                && d.line == Some(109)
+            d.file_path.as_deref().is_some_and(|p| p.ends_with("te.h")) && d.line == Some(109)
         }));
         assert!(diags.iter().any(|d| {
             d.file_path

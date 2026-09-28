@@ -11,9 +11,18 @@ pub struct Database {
 
 impl Clone for Database {
     fn clone(&self) -> Self {
-        let conn = Connection::open(&self.db_path)
-            .unwrap_or_else(|_| Connection::open(":memory:").unwrap());
-        configure_connection(&conn).ok();
+        let conn = Connection::open(&self.db_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to reopen grph database at {}: {err}",
+                self.db_path.display()
+            )
+        });
+        configure_connection(&conn).unwrap_or_else(|err| {
+            panic!(
+                "failed to configure grph database at {}: {err}",
+                self.db_path.display()
+            )
+        });
         Self {
             conn,
             db_path: self.db_path.clone(),
@@ -24,8 +33,8 @@ impl Clone for Database {
 impl Database {
     /// Open (or create) the database at `.grph/grph.db`.
     ///
-    /// Creates the `.grph` directory and schema on first use so `grph index`
-    /// / `grph sync` do not require a separate init step.
+    /// Creates the `.grph` directory and schema on first use. Callers that must
+    /// not create a project should check that `grph.db` exists before calling.
     pub fn open(project_root: &Path) -> Result<Self> {
         let db_path = project_root.join(".grph").join("grph.db");
         let db_path_parent = db_path.parent().unwrap();

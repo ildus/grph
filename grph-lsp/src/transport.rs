@@ -111,7 +111,7 @@ impl LspSession {
             }
             "textDocument/didSave" => {
                 if let Err(err) = handlers.did_save(params) {
-                    eprintln!("grph-lsp: sync failed: {err}");
+                    eprintln!("grph-lsp: index --file failed: {err}");
                 }
                 return None;
             }

@@ -28,23 +28,16 @@ enum Commands {
         /// Number of parallel parsing workers
         #[arg(short = 'j', long)]
         jobs: Option<usize>,
-        /// Skip post-index cross-file resolution; run `grph sync --resolve` later
+        /// Skip post-index cross-file resolution; run `grph index --resolve` later
         #[arg(long)]
         no_resolve: bool,
         /// Use compile_commands.json as a C/C++/Esqlc resolver hint; does not restrict scanning
         #[arg(long)]
         compile_commands: Option<PathBuf>,
-    },
-
-    /// Incrementally sync changed files
-    Sync {
-        /// Project path
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        /// Sync only this file
+        /// Index only this file
         #[arg(long)]
         file: Option<PathBuf>,
-        /// Resolve pending cross-file references without syncing files
+        /// Resolve pending cross-file references without indexing files
         #[arg(long)]
         resolve: bool,
         /// Number of unresolved reference groups to resolve in this pass
@@ -213,7 +206,14 @@ enum Commands {
     },
 }
 
-fn main() -> grph_core::Result<()> {
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> grph_core::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -224,88 +224,75 @@ fn main() -> grph_core::Result<()> {
             jobs,
             no_resolve,
             compile_commands,
-        } => {
-            let path = resolve_path(&path);
-            let mut grph = grph_core::Grph::open(&path)?;
-
-            if !quiet {
-                println!("Indexing...");
-                if compile_commands.is_none() {
-                    print_compile_commands_hint(&path);
-                }
-            }
-
-            let result = grph.index_with_jobs_force_resolve_and_compile_commands(
-                index_jobs(jobs),
-                force,
-                !no_resolve,
-                compile_commands.as_deref(),
-                |progress| {
-                    if !quiet {
-                        print_index_progress(&progress);
-                    }
-                },
-            )?;
-
-            println!(
-                "Indexed {} files, {} nodes, {} edges",
-                result.files_indexed, result.nodes_created, result.edges_created
-            );
-        }
-        Commands::Sync {
-            path,
             file,
             resolve,
             resolve_limit,
         } => {
             let path = resolve_path(&path);
             if resolve {
-                let grph = grph_core::Grph::open(&path)?;
+                let grph = grph_core::Grph::open_or_create(&path)?;
                 let resolved = if let Some(file) = file {
-                    let file = if file.is_absolute() {
-                        file
-                    } else {
-                        path.join(file)
-                    };
+                    let file = resolve_file(&path, file);
                     grph.resolve_pending_refs_for_file_with_progress(
                         &file,
                         resolve_limit,
                         |progress| {
-                            print_resolution_progress(&progress);
+                            if !quiet {
+                                print_resolution_progress(&progress);
+                            }
                         },
                     )?
                 } else {
                     grph.resolve_pending_refs_with_progress(resolve_limit, |progress| {
-                        print_resolution_progress(&progress);
+                        if !quiet {
+                            print_resolution_progress(&progress);
+                        }
                     })?
                 };
                 print_resolution_result("pending", &resolved);
-            } else {
-                let mut grph = grph_core::Grph::open(&path)?;
-                let result = if let Some(file) = file {
-                    let file = if file.is_absolute() {
-                        file
-                    } else {
-                        path.join(file)
-                    };
-                    eprintln!("Syncing {}...", file.display());
-                    grph.sync_file_with_progress(&file, |progress| {
+            } else if let Some(file) = file {
+                let file = resolve_file(&path, file);
+                let mut grph = grph_core::Grph::open_or_create(&path)?;
+                if !quiet {
+                    eprintln!("Indexing {}...", file.display());
+                }
+                let result = grph.index_file(&file, !no_resolve, |progress| {
+                    if !quiet {
                         print_resolution_progress(&progress);
-                    })?
-                } else {
-                    eprintln!("Syncing...");
-                    grph.sync_with_progress(
-                        |progress| {
-                            print_sync_progress(&progress);
-                        },
-                        |progress| {
-                            print_resolution_progress(&progress);
-                        },
-                    )?
-                };
+                    }
+                })?;
                 println!(
-                    "Synced: {} changed, {} added, {} deleted",
-                    result.files_changed, result.files_added, result.files_deleted
+                    "Indexed {}: {} changed, {} added, {} deleted",
+                    file.display(),
+                    result.files_changed,
+                    result.files_added,
+                    result.files_deleted
+                );
+            } else {
+                let mut grph = grph_core::Grph::open_or_create(&path)?;
+
+                if !quiet {
+                    println!("Indexing...");
+                    if compile_commands.is_none() {
+                        print_compile_commands_hint(&path);
+                    }
+                }
+
+                let result = grph.index_with_jobs_force_resolve_and_compile_commands(
+                    index_jobs(jobs),
+                    force,
+                    !no_resolve,
+                    compile_commands.as_deref(),
+                    |progress| {
+                        if !quiet {
+                            print_index_progress(&progress);
+                        }
+                    },
+                )?;
+
+                println!(
+                    "Indexed {} files, {} nodes, {} edges",
+                    result.files_indexed, result.nodes_created, result.edges_created
                 );
             }
         }
@@ -578,26 +565,6 @@ fn print_index_progress(progress: &grph_core::extraction::IndexProgress) {
     let _ = io::stderr().flush();
 }
 
-fn print_sync_progress(progress: &grph_core::extraction::SyncProgress) {
-    if progress.phase == "complete" {
-        eprintln!();
-        return;
-    }
-    use std::io::{self, Write};
-    let _ = write!(
-        io::stderr(),
-        "\r\x1b[K[sync {}/{} | changed {} added {} deleted {}] {}: {}",
-        progress.current,
-        progress.total,
-        progress.files_changed,
-        progress.files_added,
-        progress.files_deleted,
-        progress.phase,
-        progress.current_file.as_deref().unwrap_or("")
-    );
-    let _ = io::stderr().flush();
-}
-
 fn print_resolution_progress(progress: &grph_core::types::ResolutionProgress) {
     if progress.phase == "complete" {
         eprintln!();
@@ -633,6 +600,14 @@ fn print_resolution_result(label: &str, result: &grph_core::resolution::Resoluti
         result.remaining
     );
 }
+fn resolve_file(project_root: &std::path::Path, file: PathBuf) -> PathBuf {
+    if file.is_absolute() {
+        file
+    } else {
+        project_root.join(file)
+    }
+}
+
 fn resolve_path(path: &PathBuf) -> PathBuf {
     if path.is_absolute() {
         path.clone()

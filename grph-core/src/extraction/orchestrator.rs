@@ -282,7 +282,7 @@ impl ExtractionOrchestrator {
                                 total_nodes += nodes as u64;
                                 total_edges += edges as u64;
                             }
-                            Err(e) => eprintln!("WARN: Failed to store parsed batch: {}", e),
+                            Err(e) => return Err(e),
                         }
                     }
                 }
@@ -330,7 +330,7 @@ impl ExtractionOrchestrator {
                     total_nodes += nodes as u64;
                     total_edges += edges as u64;
                 }
-                Err(e) => eprintln!("WARN: Failed to store final parsed batch: {}", e),
+                Err(e) => return Err(e),
             }
         }
 
@@ -496,27 +496,7 @@ impl ExtractionOrchestrator {
                 continue;
             }
 
-            let content = match fs::read(file_path) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(e) => {
-                    eprintln!("WARN: Failed to read {}: {}", file_path.display(), e);
-                    continue;
-                }
-            };
-            let content_hash = Self::hash_content(&content);
-            if existing_file
-                .as_ref()
-                .map(|file| {
-                    file.content_hash == content_hash
-                        && file.size == file_info.size
-                        && file.modified_at >= file_info.modified_at
-                })
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            let Some(language) = detect_language_for_content(file_path, &content) else {
+            let Some(language) = detect_language(file_path) else {
                 continue;
             };
             progress(SyncProgress {
@@ -528,7 +508,7 @@ impl ExtractionOrchestrator {
                 files_added,
                 files_deleted,
             });
-            match self.parse_and_store_content(file_path, &rel_path, language, content) {
+            match self.parse_and_store(file_path, &rel_path, language) {
                 Ok((nodes, edges)) => {
                     nodes_created += nodes as u64;
                     edges_created += edges as u64;
@@ -616,25 +596,6 @@ impl ExtractionOrchestrator {
             let bytes = fs::read(&absolute_path)?;
             String::from_utf8_lossy(&bytes).into_owned()
         };
-        let content_hash = Self::hash_content(&content);
-        if existing_file
-            .as_ref()
-            .map(|file| {
-                file.content_hash == content_hash
-                    && file.size == file_info.size
-                    && file.modified_at >= file_info.modified_at
-            })
-            .unwrap_or(false)
-        {
-            return Ok(SyncResult {
-                files_changed: 0,
-                files_added: 0,
-                files_deleted: 0,
-                nodes_created: 0,
-                edges_created: 0,
-            });
-        }
-
         let Some(language) = detect_language_for_content(&absolute_path, &content) else {
             let existed = existing_file.is_some();
             self.db.delete_file_nodes(&relative_path)?;

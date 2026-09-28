@@ -159,7 +159,10 @@ impl ContextBuilder {
                 query: query.to_string(),
                 intent: analyzed.intent,
                 confidence_note: analyzed.confidence_note.or_else(|| {
-                    Some("No relevant symbols found — try a symbol name or file:line diagnostic.".into())
+                    Some(
+                        "No relevant symbols found — try a symbol name or file:line diagnostic."
+                            .into(),
+                    )
                 }),
                 next_reads: Vec::new(),
                 entry_points: Vec::new(),
@@ -231,7 +234,12 @@ impl ContextBuilder {
         apply_file_diversity_cap(&mut nodes, &root_ids, opts.max_nodes);
         apply_non_prod_cap(&mut nodes, &root_ids, opts.max_nodes, query);
         prune_low_information_related_nodes(&mut nodes, &root_ids, &analyzed.content_terms);
-        self.add_relationship_context(&mut nodes, &root_ids, &analyzed.content_terms, opts.max_nodes)?;
+        self.add_relationship_context(
+            &mut nodes,
+            &root_ids,
+            &analyzed.content_terms,
+            opts.max_nodes,
+        )?;
         apply_diagnostic_rerank(&mut nodes, &analyzed);
         nodes.sort_by(|a, b| b.score.total_cmp(&a.score));
         nodes.truncate(opts.max_nodes);
@@ -525,10 +533,11 @@ impl ContextBuilder {
         }
 
         // Compatibility fallback for indexes created before files_fts was
-        // populated. This keeps old projects useful until the next sync/index.
+        // populated. This keeps old projects useful until the next index.
         if file_hits.is_empty() {
             for file in self.db.list_files(None)? {
-                let path_score = path_relevance(&file.path, terms) + analyzed.path_boost(&file.path);
+                let path_score =
+                    path_relevance(&file.path, terms) + analyzed.path_boost(&file.path);
                 let path = self.resolve_source_path(&file.path);
                 let Ok(content) = std::fs::read_to_string(path) else {
                     continue;
@@ -1319,10 +1328,7 @@ fn build_next_reads(
     out
 }
 
-fn confidence_from_scores(
-    entry_points: &[ScoredNode],
-    analyzed: &AnalyzedQuery,
-) -> Option<String> {
+fn confidence_from_scores(entry_points: &[ScoredNode], analyzed: &AnalyzedQuery) -> Option<String> {
     let top = entry_points.first()?;
     let second = entry_points.get(1).map(|s| s.score).unwrap_or(0.0);
     let gap = top.score - second;
@@ -1338,9 +1344,7 @@ fn confidence_from_scores(
         );
     }
     if top.reason.contains("single-term dampened") || gap < 15.0 {
-        return Some(
-            "Low — top hits are close/weak; narrow with a symbol or file:line".into(),
-        );
+        return Some("Low — top hits are close/weak; narrow with a symbol or file:line".into());
     }
     if gap >= 50.0 && top.reason.contains("exact") {
         return Some(format!("High — strong exact match `{}`", top.node.name));

@@ -28,11 +28,19 @@ pub struct Grph {
 }
 
 impl Grph {
-    /// Open (or create) the Grph database for a project directory.
+    /// Open an existing Grph database.
     ///
-    /// Creates `.grph/grph.db` and the schema if missing. Prefer this for
-    /// indexing and syncing; a separate init step is not required.
+    /// Does not create `.grph/grph.db`. Use [`Self::open_or_create`] from `index`.
     pub fn open(project_root: &std::path::Path) -> Result<Self> {
+        let db_path = project_root.join(".grph").join("grph.db");
+        if !db_path.is_file() {
+            return Err(GrphError::NotInitialized);
+        }
+        Self::open_or_create(project_root)
+    }
+
+    /// Open the project database, creating `.grph/grph.db` and the schema if missing.
+    pub fn open_or_create(project_root: &std::path::Path) -> Result<Self> {
         let db = Database::open(project_root)?;
         Ok(Self {
             db,
@@ -40,9 +48,9 @@ impl Grph {
         })
     }
 
-    /// Alias for [`Self::open`]. Kept for call sites that historically used init.
+    /// Alias for [`Self::open_or_create`].
     pub fn init(project_root: &std::path::Path) -> Result<Self> {
-        Self::open(project_root)
+        Self::open_or_create(project_root)
     }
 
     /// Get the database connection
@@ -74,7 +82,7 @@ impl Grph {
 
     /// Run extraction/indexing with explicit control over the post-index
     /// cross-file resolver. Large macro-heavy C projects may prefer to skip
-    /// resolution during indexing and run `grph sync --resolve` later.
+    /// resolution during indexing and run `grph index --resolve` later.
     pub fn index_with_jobs_and_resolve(
         &mut self,
         jobs: usize,
@@ -161,22 +169,18 @@ impl Grph {
         Ok(result)
     }
 
-    /// Sync one file and resolve only references emitted by that file.
-    pub fn sync_file(&mut self, file_path: &std::path::Path) -> Result<extraction::SyncResult> {
-        self.sync_file_with_progress(file_path, |_| {})
-    }
-
-    /// Sync one file with resolution progress.
-    pub fn sync_file_with_progress(
+    /// Index one file and resolve only references emitted by that file.
+    pub fn index_file(
         &mut self,
         file_path: &std::path::Path,
+        resolve: bool,
         resolve_progress: impl Fn(types::ResolutionProgress),
     ) -> Result<extraction::SyncResult> {
         let mut orchestrator =
             ExtractionOrchestrator::new(self.db.clone(), self.project_root.clone())?;
         let result = orchestrator.sync_file(file_path)?;
 
-        if result.files_changed > 0 || result.files_added > 0 {
+        if resolve && (result.files_changed > 0 || result.files_added > 0) {
             let relative_path = if file_path.is_absolute() {
                 file_path
                     .strip_prefix(&self.project_root)
@@ -207,6 +211,20 @@ impl Grph {
         }
 
         Ok(result)
+    }
+
+    /// Index one file and resolve references it emitted.
+    pub fn sync_file(&mut self, file_path: &std::path::Path) -> Result<extraction::SyncResult> {
+        self.index_file(file_path, true, |_| {})
+    }
+
+    /// Index one file with resolution progress.
+    pub fn sync_file_with_progress(
+        &mut self,
+        file_path: &std::path::Path,
+        resolve_progress: impl Fn(types::ResolutionProgress),
+    ) -> Result<extraction::SyncResult> {
+        self.index_file(file_path, true, resolve_progress)
     }
 
     /// Resolve cross-file references — only prints if there's work to do.

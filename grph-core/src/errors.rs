@@ -14,7 +14,7 @@ pub enum GrphError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Not initialized: run `grph index` or `grph sync` first")]
+    #[error("Not initialized: run `grph index` first")]
     NotInitialized,
 
     #[error("File not found: {0}")]
